@@ -1,0 +1,10 @@
+*.o
+*.od
+*.or
+*.aig
+callgrind.out.*
+.kdbgrc.*
+minireachIC3
+minireachIC3_debug
+minireachIC3_release
+depend.mk

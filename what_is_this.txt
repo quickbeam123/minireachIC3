@@ -1,0 +1,1 @@
+Extending minireachReuse with IC3 clause maintanance scheme: Layers are monotonte, delta encoded, and after each phase clauses are pushed forward.
