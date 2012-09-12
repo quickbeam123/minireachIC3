@@ -34,7 +34,7 @@ struct LessThan_default {
     bool operator () (T x, T y) { return x < y; }
 };
 
-// MS: 
+// MS:
 template<class T>
 struct GreaterThan_default {
     bool operator () (T x, T y) { return y < x; }
