@@ -58,12 +58,14 @@ static BoolOption opt_elimination ("MAIN", "simp", "Perform variable elimination
 
 static IntOption opt_phaselim ("MAIN", "phaselim", "Terminate after a given number of phases.", 0, IntRange(0,INT32_MAX));
 
-// TODO: This could only make sense under some in-phase clause pushing scenario
-static BoolOption opt_earlycheck ("MAIN", "early", "Test for layer repetition each time new clauses enter a layer.", false); 
-static BoolOption opt_masubs("MAIN", "masubs", "Test model assumptions for subsumption by layers/univs before actually passing them on to solver.", true);
+// TODO: should try handling obligations queue-wise (currently is stack-wise) - longer model paths have preference ...
+static BoolOption opt_earlystop ("MAIN", "earlystop", "Don't put weak clauses into strong layers.", true); // seems to be a good idea after all
+static BoolOption opt_subskills ("MAIN", "subskills", "Subsumption kills obligations for good.", false);   // not a good idea overall 
+static BoolOption opt_survive ("MAIN", "survive", "Obligations survive between phases.", false);           // helps for easy guys 
 
 static IntOption opt_resched ("MAIN", "resched", "Reschedule obligations (allows long models).", 1, IntRange(0,3));
 
+static BoolOption opt_statpushing("STAT", "spushing", "Print pushing statistics.", true);
 static BoolOption opt_statclauses("STAT", "sclauses", "Print layer clause statistics.", true);
 static BoolOption opt_statobligations("STAT", "sobligations", "Print model statistics.", true);
 static BoolOption opt_statmodel("STAT", "smodel", "Print model statistics.", true);
@@ -108,41 +110,109 @@ void printIStars(int i) {
 
 //=================================================================================================
 
-static int ids = 0;
+#define ABSTRACTION_TYPE  uint32_t
+#define ABSTRACTION_BITS  (31)
+
+ABSTRACTION_TYPE calcAbstraction(vec<Lit> const & data) {
+  ABSTRACTION_TYPE res = 0;
+  for (int i = 0; i < data.size(); i++)
+    res |= 1 << (var(data[i]) & ABSTRACTION_BITS);
+  return res;
+}
+
+//=================================================================================================
 
 struct Obligation {
-  int id;
-  int idx;
   int depth;
+  
   vec<Lit> ma;
+  ABSTRACTION_TYPE abs; // abstraction of the above
   
-  Obligation *next; // used for the list of free obligations
-  
-  Obligation(int given) {
-    id = given;
-  }
-  
-  void print() {
-    printf("id: %d, idx: %d, depth: %d, size: %d\n",id,idx,depth,ma.size());
-  }  
+  void copyTo(Obligation& copy) const { copy.depth = depth; copy.abs = abs; ma.copyTo(copy.ma); }
+  void moveTo(Obligation& dest)       { dest.depth = depth; dest.abs = abs; ma.moveTo(dest.ma); }  
 };
 
-struct ObligationCmp {
-  bool operator() (Obligation *lhs, Obligation *rhs) const
-  {   
-    if (lhs->idx > rhs->idx) // I am small (less likely to be picked next) if my index is high
-      return true;      
-      
-    if (lhs->idx < rhs->idx)
-      return false;      
-          
-    return (lhs->depth > rhs->depth);   // This is rather arbitrary:
-    /*
-    The opposite version favours deep couterexamples and indeed seems to be slightly better on SAT instances.
-    This one, on the other hand, goes forward with the shallow obligations first (i.e. prefers to do first what resched=0 does)
-    and seems to be slightly better on unsat (esp in rev).
-    */
+static int ids = 0;
+
+/* wrapper for layer clauses and their witness */
+struct CWBox {
+  int id;
+
+  vec<Lit> data;         // for clause the actual literals, for witness the negated state as a clause
+  ABSTRACTION_TYPE abs;  // abstraction of the above
+  
+  CWBox*  other;  // the other of the two
+  
+  CWBox*  next;    // to form a linked list  
+  CWBox** prev;    // to delete from anywhere
+  
+  CWBox() : abs(0), other(0), next(0), prev(0) { id = ids ++; }
+  CWBox(ABSTRACTION_TYPE a, vec<Lit> const & d) : abs(a), other(0), next(0), prev(0) { d.copyTo(data); id = ids ++; } 
+    
+  void integrate(CWBox** holder) {  // like insert
+    assert(holder);
+    next = *holder;
+    *holder = this;
+    prev = holder;
+    if (next) {
+      assert(next->prev == holder);
+      next->prev = &next;
+    }    
   }
+     
+  void disintegrate() {             // like remove 
+    assert(prev);
+    assert(*prev == this);
+    *prev = next;
+    if (next) {
+      assert(next->prev == &next);      
+      next->prev = prev;
+    }
+  }
+  
+  void relocate(CWBox** holder) {   // like move (with all the guys below)        
+    // similar to first half of disintegrate
+    assert(prev);
+    assert(*prev == this);
+    *prev = 0;
+  
+    // similar to first half of integrate
+    assert(holder);
+    *holder = this;
+    prev = holder;
+  }
+  
+};
+
+void printCWBox(CWBox* box) {
+  while (box) {
+    if (box->next) {
+      assert(box->next->prev == &box->next);    
+    }    
+    printf("%d -> ",box->id);
+    
+    box = box->next;
+  }
+  
+  printf("\n");
+}
+
+// a wrapper for vec< CWBox* > that repairs prev pointers in all the members if reallocation happens
+struct CBoxVec {
+  vec< CWBox* > data;
+
+  CWBox* const & operator [] (int index) const { return data[index]; }
+  CWBox* &       operator [] (int index)       { return data[index]; }
+  
+  int  size(void) const   { return data.size(); }  
+  void push(void) {
+    data.push(0);
+    
+    // could reallocate - repair the pointers!!!
+    for (int i = 0; i < data.size(); i++)
+      if (data[i])
+        data[i]->prev = &data[i];
+  }  
 };
 
 struct SolvingContext {
@@ -156,92 +226,107 @@ struct SolvingContext {
   // TODO: this idea should be extended up to the point where the low signature part of the solver is only as big as the bridge (the rest of the variables are just rubbish!)
   // Well, in general this is a little more complicated: remember there is S_in, S_out, and S_reg in the  Niklases' paper -- the low signature should contain S_in and S_reg
 
-  vec<MarkingSolver*> solvers;
-  vec<JustClauseSet*> layers;   
-    
   int phase;
-  int least_affected_layer;  
   
-  // statistics   
-  int clauses_dersolver;
-  int clauses_univ;
-  int clauses_pushed;
-  int clauses_strengthened;
-  int clauses_pushsubsumed;
+  vec<MarkingSolver*> solvers;
+  
+  CBoxVec layers;         // here sit the clauses   
+  CBoxVec push_requests;  // and here
+  CBoxVec witnesses;      //  or here their respective bros
+   
+  vec< vec<Obligation> > obligations;
+        
+  // statistics
+  int pushing_request;
+  int pushing_nontriv_request;
+  int pushing_success;
   
   int oblig_processed;
   int oblig_subsumed;
   int oblig_sat;
   int oblig_unsat;
+  int oblig_resched_clause;
+  int oblig_resched_subs;   
+  
+  int clauses_dersolver;
+  int clauses_univ;
+  int clauses_strengthened;  
+     
+  
+     
+  int solver_call_extension;
+  int solver_call_push;
   
   int minim_attempts;  
   int minim_solver;
   int minim_explicit;
-  int minim_iductively;
+  int minim_inductively;
   int minim_push;
     
   int model_min_layer;
-  int model_max_depth;  
-
-  // obligation pool
-  
-  Obligation *pool;
-  int poolsize;  
-  
-  Obligation* acquireObligation() {
-    Obligation* res;
-    if (pool) {
-      res = pool;
-      // res->id = ids++;
-      pool = pool->next;            
-    } else {
-      poolsize++;
-      res = new Obligation(ids++);      
-    }
-
-    return res;
-  }
-  
-  void releaseObligation(Obligation* ob) {
-    ob->next = pool;
-    pool = ob;
-  }
-  
-  std::priority_queue<Obligation*,std::vector<Obligation*>,ObligationCmp> obligations;  
+  int model_max_depth;   
      
-  SolvingContext() : phase(-1),    
-                     least_affected_layer(0),
-                     clauses_dersolver(0), clauses_univ(0), clauses_pushed(0), clauses_strengthened(0), clauses_pushsubsumed(0),
-                     oblig_processed(0), oblig_subsumed(0), oblig_sat(0), oblig_unsat(0),
-                     minim_attempts(0), minim_solver(0), minim_explicit(0), minim_iductively(0), minim_push(0),
-                     model_min_layer(0), model_max_depth(0),  
-                     pool(0), poolsize(0),
+  SolvingContext() : phase(-1),
+                     pushing_request(0), pushing_nontriv_request(0), pushing_success(0),
+                     oblig_processed(0), oblig_subsumed(0), oblig_sat(0), oblig_unsat(0), oblig_resched_clause(0), oblig_resched_subs(0),                                                                                                        
+                     clauses_dersolver(0), clauses_univ(0), clauses_strengthened(0),                                         
+                     solver_call_extension(0), solver_call_push(0),                     
+                     minim_attempts(0), minim_solver(0), minim_explicit(0), minim_inductively(0), minim_push(0),
+                     model_min_layer(0), model_max_depth(0),                       
                      called(0)
   { }    
 
+  void deleteClause(CWBox *cl_box) {
+    if (cl_box->other) {
+      cl_box->other->disintegrate();
+      delete cl_box->other;
+    }
+    cl_box->disintegrate();
+    delete cl_box;
+  }
+  
   ~SolvingContext() {
     if (opt_verbose)
       printGOStat();      
 
-    for (int i = 0; i < solvers.size(); i++)
-      delete solvers[i];
-      
     for (int i = 0; i < layers.size(); i++)
-      delete layers[i];
+      while (layers[i])
+        deleteClause(layers[i]);
 
-    while (!obligations.empty()) {      
-      delete obligations.top();
-      obligations.pop();
-    }
-
-    while (pool) {
-      Obligation* next = pool->next;      
-      delete pool;
-      pool = next;    
-    }       
+    for (int i = 0; i < solvers.size(); i++)
+      delete solvers[i];     
   }
   
-  void printStatExtending(bool between_phases = false) {
+  void printStat(bool between_phases = false) {
+    if (opt_statpushing) {
+      printf("\nClause pushing:\n");                     
+      printf("\t%d requests handled.\n",pushing_request);
+      printf("\t%d proper - %d clauses pushed.\n", pushing_nontriv_request,pushing_success);                     
+    
+      pushing_request = 0;     
+      pushing_nontriv_request = 0;
+      pushing_success = 0;      
+    }
+       
+    if (opt_statobligations) {
+      printf("\nObligations:\n");
+      printf("\t%d processed,\n",oblig_processed);
+      printf("\t%d extended,\n",oblig_sat);
+      printf("\t%d blocked,\n",oblig_unsat);    
+      printf("\t%d subsumed,\n",oblig_subsumed);
+      printf("\t%d rescheduled due to clause,\n",oblig_resched_clause);
+      printf("\t%d rescheduled due to subsumption.\n",oblig_resched_subs);      
+           
+      //printf("   maoccursz: %zu\n",mas.size());
+      
+      oblig_processed = 0;
+      oblig_subsumed = 0;            
+      oblig_sat = 0;
+      oblig_unsat = 0;      
+      oblig_resched_clause = 0;
+      oblig_resched_subs = 0;
+    }  
+  
     if (opt_statclauses) {
       printf("\nClauses:\n");
       printf("\t%d derived by solver (%d universals), subsumed %d.\n",clauses_dersolver,clauses_univ,clauses_strengthened);
@@ -250,15 +335,16 @@ struct SolvingContext {
       int length_max = 0;
       int length_sum = 0;
            
-      for (int i = 1; i <= phase+1; i++)
-        for (JustClauseSet::Iterator it = layers[i]->getIterator(); it.isValid(); it.next()) {
-          vec<Lit> const & clause = it.getClause();
+      for (int i = 1; i <= phase+1; i++) {                    
+        for (CWBox* cl_box = layers[i]; cl_box != 0; cl_box = cl_box->next) {
+          vec<Lit> const & clause = cl_box->data;
                              
           if (clause.size() > length_max)
             length_max = clause.size();            
           length_sum += clause.size();
           inlayers += 1;                
-        }           
+        }
+      }
 
       printf("\tKept: %d ",inlayers);
       printf("(max %d lits, %f lits on average).\n",length_max, (1.0*length_sum)/inlayers);
@@ -266,33 +352,18 @@ struct SolvingContext {
       clauses_dersolver = 0;
       clauses_univ = 0;  
       clauses_strengthened = 0;      
-    }    
-    
-    if (opt_statobligations) {
-      printf("\nObligations:\n");
-      printf("\t%d processed,\n",oblig_processed);
-      printf("\t%d subsumed,\n",oblig_subsumed);           
-      printf("\t%d extended,\n",oblig_sat);
-      printf("\t%d blocked.\n",oblig_unsat);    
-
-      //printf("   maoccursz: %zu\n",mas.size());
-      
-      oblig_processed = 0;
-      oblig_subsumed = 0;      
-      oblig_sat = 0;
-      oblig_unsat = 0;
-    }
+    }       
     
     if (opt_minimize && opt_sminim) {
       printf("\nMinimzation averages from %d attempts:\n", minim_attempts);
       printf("\t%f by solver,\n",(1.0*minim_solver)/minim_attempts);      
-      printf("\t%f by picking (%f from inducive passes),\n",(1.0*minim_explicit)/minim_attempts,(1.0*minim_iductively)/minim_attempts);
+      printf("\t%f by picking (%f from inducive passes),\n",(1.0*minim_explicit)/minim_attempts,(1.0*minim_inductively)/minim_attempts);
       printf("\t%f by pushing.\n",(1.0*minim_push)/minim_attempts);
             
       minim_attempts = 0;
       minim_solver = 0;      
       minim_explicit = 0;
-      minim_iductively = 0;
+      minim_inductively = 0;
       minim_push = 0;    
     }
     
@@ -306,52 +377,53 @@ struct SolvingContext {
   
     if (opt_statlayer) {
       printf("\nLayers: ");
-      for (int i = 0; i <= phase+1; i++)        
-        printf("%d%s%s",layers[i]->size(),(i == phase+1) ? "]" : "|",(i == phase) ? "[" : "");
+      for (int i = 0; i <= phase+1; i++) {
+        int sz = 0;
+        for (CWBox* cl_box = layers[i]; cl_box != 0; cl_box = cl_box->next, sz++);         
+        printf("%d%s%s",sz,(i == phase+1) ? "]" : "|",(i == phase) ? "[" : "");
+      }
       printf("\n");
-    }      
-  }
-  
-  void printStatPushing(bool between_phases = false) {
-    if (opt_statclauses) {
-      printf("\nClause pushing:\n");
-      printf("\t%d pushed, %d subsumed.\n",clauses_pushed,clauses_pushsubsumed);
-    
-      clauses_pushed = 0;       
-      clauses_pushsubsumed = 0;
-    }    
-          
-    if (opt_statlayer && between_phases) {
-      printf("\nLayers: ");
-      for (int i = 0; i <= phase+1; i++)        
-        printf("%d%s%s",layers[i]->size(),(i == phase+1) ? "]" : "|",(i == phase) ? "[" : "");
-      printf("\n");
-    }    
-  
+      
+      printf("Avg sz: : ");           
+      for (int i = 0; i <= phase+1; i++) {
+        int sz = 0;
+        int lensum = 0;
+        for (CWBox* cl_box = layers[i]; cl_box != 0; cl_box = cl_box->next) {
+          sz++;
+          lensum += cl_box->data.size();
+        }
+        if (sz)
+          printf("%d%s%s",lensum/sz,(i == phase+1) ? "]" : "|",(i == phase) ? "[" : "");
+        else
+          printf("-%s%s",(i == phase+1) ? "]" : "|",(i == phase) ? "[" : "");                        
+      }
+      
+    } 
+
     if (opt_sttime) {
       clock_StopAddPassedTime(clock_MAIN);
     
       printf("\nTime:\n");
-      printf("\tspent in solver extending %fsec\n",clock_GetAkku(clock_SOLVER_EXTEND));
-      printf("\tspent in solver pushing   %fsec\n",clock_GetAkku(clock_SOLVER_PUSH));
+      printf("\tspent in solver extending %fsec (%f call per sec on average)\n",clock_GetAkku(clock_SOLVER_EXTEND),solver_call_extension/clock_GetAkku(clock_SOLVER_EXTEND));
+      printf("\tspent in solver pushing   %fsec (%f call per sec on average)\n",clock_GetAkku(clock_SOLVER_PUSH),solver_call_push/clock_GetAkku(clock_SOLVER_PUSH));
       printf("\tspent in main   %fsec.\n",clock_GetAkku(clock_MAIN));
       
       clock_InitCounter(clock_MAIN);
       clock_StartCounter(clock_MAIN);
       clock_InitCounter(clock_SOLVER_EXTEND);
       clock_InitCounter(clock_SOLVER_PUSH);
-    }  
-  }
+      
+      solver_call_extension = 0;
+      solver_call_push = 0;
+    }
+   
+  }  
   
   void printGOStat() {
     printf("// Game over during phase: %d.\n",phase);   
            
     if (phase >= 0)
-      printStatExtending();
-      
-    if (phase >= 0)
-      printStatPushing();
-     
+      printStat();             
 /*     
     for (int i = 0; i <= phase+1; i++)  {
       printf("Layer %d\n",i);    
@@ -387,35 +459,10 @@ struct SolvingContext {
     }
   }
   */
-  
-  vec<Lit> tmp_ma;
-  
-  bool maSubsumedInLayer(vec<Lit> &ma, int idx) {          
-    tmp_ma.clear();
-    tmp_ma.growTo(ma.size());    
-    for (int i = 0; i < ma.size(); i++)
-      if (var(ma[i]) < sigsize)
-        tmp_ma[i] = mkLit(var(ma[i])+sigsize,!sign(ma[i]));
-      else {
-        assert(var(ma[i]) == 2*sigsize);
-        tmp_ma[i] = ~ma[i];
-      }
       
-    assert(clause_sorted(tmp_ma));
-
-    // note that as we store the goal_lit in all clauses in layers,
-    // this subsumption check only ever works because goal_lit is part of the bridge
-    // (and all the generated ma's don't satisfy the goal -- otherwise we would terminate with SAT)
-    
-    for ( ; idx <= phase+1; idx++)
-      if (layers[idx]->isSubsumed(tmp_ma))        
-        return true;
-           
-    return false;            
-  }
-
   static const int inductive_layer_idx; 
   
+  vec<Lit> ma_tmp;
   vec<int> marks_tmp;
   
   // OUTPUT from callSolver()
@@ -442,12 +489,21 @@ struct SolvingContext {
     clock_StopAddPassedTime(clock_MAIN);
     clock_StartCounter(cc);
 
+    ma_tmp.clear();
+    for (int i = 0; i < ma.size(); i++) {
+      assert(var(ma[i]) >= sigsize);
+      if (var(ma[i]) < 2*sigsize)
+        ma_tmp.push(mkLit(var(ma[i])-sigsize,!sign(ma[i])));
+      else 
+        ma_tmp.push(ma[i]);
+    }
+    
     minimark_in.clear();
     for (int i = idx; i <= phase; i++)
       minimark_in.push(i);
     minimark_in.push(inductive_layer_idx); 
     
-    solver.preprocessAssumptions(ma,minimark_in);    
+    solver.preprocessAssumptions(ma_tmp,minimark_in);    
     bool result = (solver.simplify(),solver.solve());
     
     if (!result && compute_conflict) {
@@ -456,7 +512,7 @@ struct SolvingContext {
       if (opt_minimize) {
         minim_attempts++;
       
-        minim_solver += ma.size() - conflict_out.size();
+        minim_solver += ma_tmp.size() - conflict_out.size();
                                  
         //turn the conflict clause back to assumptions
         for (int i = 0; i < conflict_out.size(); i++)
@@ -511,7 +567,7 @@ struct SolvingContext {
               minim_explicit++;
               removed_something = true;
               if (cycle_count) 
-                minim_iductively++;
+                minim_inductively++;
             }
           }
           cycle_count++;
@@ -525,7 +581,7 @@ struct SolvingContext {
             break;
           target_layer_out = minimark_in[i+1]; //makes sense even with inductive_layer_idx, which is the last value       
           minim_push++;
-        }        
+        }       
                      
         // prepare final version of conflict_out        
         conflict_out.clear();
@@ -560,7 +616,7 @@ struct SolvingContext {
         conflict.push(~conflict_out[i]);      
       sort(conflict);
                           
-      assert(subsumes(conflict,ma));                
+      assert(subsumes(conflict,ma_tmp));                
       
       //part two
       MarkingSolver test_solver;
@@ -609,112 +665,293 @@ struct SolvingContext {
     */
          
     return result;
-  }    
+  }  
   
-  void insertIntoSolvers(int from, int first_questionable, vec<Lit>& clause, vec<int>& markers) {  
-    int stopped = 0;
-    
-    for (int i = from; i >= 0; i--) {
-      if (!stopped && // we don't know yet      
-          i <= first_questionable && //this is the first where it could happen
-          i > 0 && // this layer is empty anyway
-          layers[i]->isSubsumed(clause))
-        stopped = i; // we could also stop inserting from this point, but maybe the weak clauses in "strong" solvers will allow for better inductive minimization (thanks to their weak marker)
-    
-      // TODO: test the above!!!
-    
-      solvers[i]->addClause(clause,markers);
-    }
-    
-//    printf("upto %d, stopped %d\n",upto,stopped);
-    
-    assert(stopped < from);
-    
-    if (stopped+1 < least_affected_layer)
-      least_affected_layer = stopped+1;    
+  bool absSubsumes(ABSTRACTION_TYPE a1, ABSTRACTION_TYPE a2) {
+    return (a1 & ~a2) == 0;
   }
   
-  bool processObligations() {
-  
-    while (!obligations.empty()) {
-      Obligation *ob = obligations.top(); obligations.pop();
+  int pruneLayerByClause(ABSTRACTION_TYPE abs, vec<Lit>const & clause, int idx, bool testForWeak = true) {
+    // frees subsumed clauses in layer
+    int res = 0; //returns the number of subsumed guys and -1 if the argument was subsumed (and testForWeak was true)       
+    
+    for (CWBox* layer_box = layers[idx]; layer_box != 0; /* update inside */) {
+      if (absSubsumes(abs,layer_box->abs) && subsumes(clause,layer_box->data)) {
+        CWBox* tmp_box = layer_box;
+        layer_box = layer_box->next;
+        //printf("subsumed clause %d\n",tmp_box->id); 
+        deleteClause(tmp_box);
+        res++;
+      } else if (testForWeak && absSubsumes(layer_box->abs,abs) && subsumes(layer_box->data,clause)) {
+        //printf("subsumed by %d\n",layer_box->id);        
+        assert(res == 0);        
+        return -1;
+      } else {
+        layer_box = layer_box->next;
+      }
+    }
+                
+    return res;
+  }
+     
+  int pruneObligations(ABSTRACTION_TYPE abs,
+                       vec<Lit>const & clause,   //the potentially subsuming clause
+                       int from,                 //the position to work on (if out of bounds, just no-op)
+                       int relocate_to) {        //the first index where they can live (if out of bounds, just kick them out)
+    if (from > phase)
+      return 0;
+
+    int res = 0;
+    vec<Obligation> & obligs = obligations[from];
+    
+    int i,j;
+    for (i=0, j=0; i < obligs.size(); i++) {
+      vec<Lit> &ma = obligs[i].ma;
             
-      int model_idx = ob->idx;            
-      vec<Lit> &our_ma = ob->ma;          
+      assert(clause_sorted(ma));
+    
+      // note that as we store the goal_lit in all clauses in layers,
+      // this subsumption check only ever works because goal_lit is part of the bridge
+      // (and all the generated ma's don't satisfy the goal -- otherwise we would terminate with SAT)
+      
+      if (absSubsumes(abs,obligs[i].abs) && subsumes(clause,ma)) {
+        res++;
+        
+        if (!opt_subskills && opt_resched && relocate_to <= phase+(opt_survive ? 1 : 0)) { 
+          obligations[relocate_to].push();                   
+          obligs[i].moveTo(obligations[relocate_to].last());
+          
+          oblig_resched_subs++;                                         
+        } else ; // killing him is for free
+      } else {
+        // keeping it here
+        if (j < i)
+          obligs[i].moveTo(obligs[j]);
+        j++;
+      }
+    }
+    obligs.shrink(i-j);
+  
+    return res;
+  }
+  
+  int pruneWitnesses(ABSTRACTION_TYPE abs,
+                     vec<Lit>const & clause,   //the potentially subsuming clause
+                     int from) {  
+    if (from > phase)
+      return 0;
+    
+    int res = 0;
+    
+    for(CWBox* wit_box = witnesses[from]; wit_box != 0; /*iteration inside*/) {
+      if (absSubsumes(abs,wit_box->abs) && subsumes(clause,wit_box->data)) { // clause will need a new witness
+        CWBox* tmp_box = wit_box;
+        wit_box = wit_box->next;
+        
+        res++;
+        
+        tmp_box->disintegrate();
+        tmp_box->integrate(&push_requests[from]);
+      } else {
+        wit_box = wit_box->next;
+      }    
+    }
+    
+    return res;
+  }
+  
+  void handleNewClause(int target_layer, int first_questionable, int upmost_layer, ABSTRACTION_TYPE abs, vec<Lit> const & clause, vec<int> const& markers) {  
+    int stopped = 0;    
+    int sum_cl_killed = 0;
+    int sum_ob_pushed = 0;
+    //printf("Inserting %s-clause to layer %d to kill ma in layer %d. ",target_layer <= phase ? "N" : "U",target_layer,first_questionable+1);
+           
+    for (int i = target_layer; i >= upmost_layer; i--) {
+      if (!stopped) {    
+        int res = pruneLayerByClause(abs,clause,i,/* maybe_weak (?)*/ i <= first_questionable /* otherwise don't test forward */ );
+                                    
+        if (res < 0) { //got subsumed here; will not subsume anymore
+          assert(i < target_layer);                 // got inserted into his target layer
+          assert(i <= first_questionable);          // should be strong even up to this point
+          stopped = i;
+          // printf("Killed in %d. ",i);                   
+          
+          if (opt_earlystop)
+            return;          
+        } else {
+          clauses_strengthened += res;
+          sum_cl_killed += res;
+          // printf("Kills %d in %d. ",res,i);
+          
+          int obl_res = pruneObligations(abs,clause,i,target_layer+1); // the new clause is still strong, could it kill/push some obligations here?
+          sum_ob_pushed += obl_res;
+          oblig_subsumed += obl_res;
+          
+          int wit_res = pruneWitnesses(abs,clause,i);
+        }
+      }
+                 
+      if (i <= phase) {// just because of the case with universal clauses, when the insertion is into the inductive layer of index phase+1
+        solvers[i]->addClause(clause,markers);                      
+      }
+      // we could also stop inserting when stopped is identified, but sometimes the weak clauses in "strong" solvers will allow for better inductive minimization (thanks to their weak marker)
+    }
+    
+    //printf("Killed %d, went %d steps deep and subsumed %d obligations\n",sum_cl_killed,target_layer-stopped,sum_ob_pushed);    
+  }
+  
+  vec<Lit> assumps;
+  
+  void lookForWitness(CWBox * cl_box, int index) {
+    vec<Lit> & clause = cl_box->data;
+
+    assumps.clear();
+    for (int l = 0; l < clause.size(); l++) {
+      assert(var(clause[l]) >= sigsize);
+      assumps.push(clause[l]);
+    }
+    assumps.push(mkLit(2*sigsize, false));
+
+    solver_call_push++;    
+    pushing_request++;
+    if (cl_box->other->data.size())
+      pushing_nontriv_request++;
+    
+    if (callSolver(index,assumps,clock_SOLVER_PUSH,false,false)) {
+      MarkingSolver &model_solver = *solvers[index];      
+      
+      // extract the witness
+      vec<Lit> & ma = cl_box->other->data;
+      ma.clear();      
+      //like when extracting ma normally
+      for (int j = 0; j < sigsize; j++) {
+        assert(model_solver.model[j+sigsize] != l_Undef);  
+        if (bridge_variables[j])                                              
+          ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and unnegated
+      }
+      // and we don't add the initial marker
+      cl_box->other->abs = calcAbstraction(ma);      
+      
+      cl_box->other->integrate(&witnesses[index]);
+    } else {     // pushed
+      marks_tmp.clear();
+      marks_tmp.push(index+1);
+    
+      pushing_success++;
+    
+      handleNewClause(index+1,index+1,index+1,cl_box->abs,clause,marks_tmp); /* it should not get subsumed there! */
+    
+      cl_box->disintegrate();
+      cl_box->integrate(&layers[index+1]);
+      cl_box->other->integrate(&push_requests[index+1]);                                        
+    }
+  }
+  
+  Obligation initial_obligation;
+  
+  bool processObligations() {      
+    int obl_top = phase + 1;  // the lowest index where there is possibly any obligation to look for    
+  
+    for (;;) {
+      // first do all the necessary pushing 
+      // (TODO: maybe stop before the current value of obl_top?)
+      // (TODO: maybe keep note of where from it makes sense to start looking for push_requests?)      
+      for (int i = 1; i < phase /*cannot push from L_{phase}, there is not L_{phase+1} yet*/; i++) {
+        while (push_requests[i]) {
+          CWBox* req_box = push_requests[i];
+          req_box->disintegrate();
+          lookForWitness(req_box->other,i);
+        }
+        
+        if (layers[i] == 0) {
+          printf("// UNSAT: repetition detected!\n");
+          if (opt_verbose)
+            printf("// Delta-layer %d emptied by pushing!\n",i);            
+          return true;
+        }
+      }
+      
+      // now handle obligations
+      Obligation ob;
+      while (obl_top <= phase && obligations[obl_top].size() == 0)
+        obl_top++;      
+        
+      if (obl_top > phase) {
+        initial_obligation.copyTo(ob);
+      } else {
+        obligations[obl_top].last().moveTo(ob);
+        obligations[obl_top].pop();
+      }        
+
+      int model_idx = obl_top-1;
+      vec<Lit> &our_ma = ob.ma;         
 
       oblig_processed++;
 
-      //printf("Obligation with model_idx %d.\n",model_idx);
-      
-      // TODO: does this pay off in IC3?
-      if (opt_masubs && maSubsumedInLayer(our_ma,model_idx+1)) {               
-        oblig_subsumed++;
-               
-        //printf("Subsumed\n");
-        
-        ob->idx++;
-        if (ob->idx >= phase || !opt_resched)
-          releaseObligation(ob);
-        else
-          obligations.push(ob);
-
-        continue;
-      }
-      
+      // printf("Obligation with model_idx %d.\n",model_idx);
+            
       if (model_idx < model_min_layer)
         model_min_layer = model_idx;
     
-      if (ob->depth > model_max_depth)
-        model_max_depth = ob->depth;
-                                  
+      if (ob.depth > model_max_depth)
+        model_max_depth = ob.depth;
+
+      solver_call_extension++;
+               
       if (callSolver(model_idx,our_ma,clock_SOLVER_EXTEND,
                     true,                                  // return conflict
-                    !(our_ma == initial_ma))               // induction is not correct for the initial call
+                    obl_top>=phase )                       // induction is not correct for the initial call
                     ) {
         oblig_sat++;
       
         if (model_idx == 0) {
-          printf("// SAT: model of length %d found\n",ob->depth+1);
-          
-          releaseObligation(ob);
+          printf("// SAT: model of length %d found\n",ob.depth+1);                   
           return true;
         }
 
         //printf("Extended\n");
         
-        // going forward
-        Obligation *new_ob = acquireObligation();
-        if (opt_resched == 3)
-          new_ob->idx = 0; //fast forward
-        else if (opt_resched == 2)
-          new_ob->idx = (model_idx == 1) ? 0 : model_idx-2; // a little forward
-        else
-          new_ob->idx = model_idx-1;                              
+        // going forward        
+        Obligation new_ob;
+        int new_top;
         
-        new_ob->depth = ob->depth+1;
+        if (opt_resched == 3)
+          new_top = 1; //fast forward
+        else if (opt_resched == 2)
+          new_top = (model_idx == 1) ? 1 : model_idx-1; // a little forward
+        else
+          new_top = model_idx;
+        
+        new_ob.depth = ob.depth+1;
 
         MarkingSolver &model_solver = *solvers[model_idx];
         
-        vec<Lit>& ma = new_ob->ma;
+        vec<Lit>& ma = new_ob.ma;
         ma.clear();
-                                      
         for (int j = 0; j < sigsize; j++) {
           assert(model_solver.model[j+sigsize] != l_Undef);    
           if (bridge_variables[j])          
-            ma.push(mkLit(j,model_solver.model[j+sigsize] == l_False));
-        }                                            
+            ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));
+        }
         // only after the previous, so that it is sorted
         ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses
+        new_ob.abs = calcAbstraction(ma);
+
+        if (ob.depth > 0) {  //otherwise it is just the initial guy which is handled differently
+          obligations[obl_top].push();
+          ob.moveTo(obligations[obl_top].last());
+        }
                 
-        obligations.push(ob);        
-        obligations.push(new_ob);
+        obligations[new_top].push();
+        new_ob.moveTo(obligations[new_top].last());
+        
+        obl_top = new_top; // follow him forward
+        
       } else {  //unsat                             
         oblig_unsat++;
         
-        if (ob->depth == 0) { //"base level conflict"
-          assert(conflict_out.size() <= 1); //only possibly the initial marker
-
-          releaseObligation(ob); 
+        if (ob.depth == 0) { //"base level conflict"
+          assert(conflict_out.size() <= 1); //only possibly the initial marker         
           
           if (conflict_out.size() == 0 || target_layer_out == inductive_layer_idx) {
             printf("// UNSAT: unconditional empty clause derived, ");
@@ -730,10 +967,18 @@ struct SolvingContext {
             return true;
           }
 
-          // TODO: should return false here ?
+          return false;
 
         } else { // regular conflict        
           clauses_dersolver++;
+          
+          // THIS IS THE RESCHEDULING PART (we could even keep them longer, but they should die eventually, shouldn't they?):
+          if (opt_resched && obl_top < phase + (opt_survive ? 1 : 0)) {
+            obligations[obl_top+1].push();
+            ob.moveTo(obligations[obl_top+1].last());
+            
+            oblig_resched_clause++;
+          } // CAREFUL we do rescheduling even before handling the clause, so that in case of generalization even this pushed ob will get killed
           
           // convert the conflict to the upper signature and possibly remove the step marker
           int i,j;      
@@ -749,86 +994,84 @@ struct SolvingContext {
           }
           conflict_out.shrink(i-j);          
           conflict_out.push(goal_lit);  // doing it the monotone way!          
-          sort(conflict_out);  // ClauseSet assumes the input is sorted
-                 
-          bool learned_univ;
-          if (target_layer_out == inductive_layer_idx) {
-            learned_univ = true;
-            clauses_univ++;
-                                   
-            //into layer
-            bool res = layers.last()->insertModuloSubsumption(conflict_out);
-            assert(res);
-            clauses_strengthened += layers.last()->subsumed_cnt;
-                                   
-            //into solvers
-            marks_tmp.clear();
-            insertIntoSolvers(phase,model_idx,conflict_out,marks_tmp);                                  
-          } else {
-            learned_univ = false;
-            
-            if (target_layer_out == phase) //there is a possibility of learning a clause that would minimally belong to a layer that doens't exist yet
-              target_layer_out = phase-1;  // we put it into the previous and a later push will move it further
+          sort(conflict_out);  // ClauseSet assumes the input is sorted                          
           
-            //into layer              
-            //printf("From layer %d into layer %d: ",model_idx,target_layer_out+1); printLits(conflict_out);            
+          ABSTRACTION_TYPE abs = calcAbstraction(conflict_out);
+          
+          if (target_layer_out == inductive_layer_idx) {
+            clauses_univ++;
+           
+            marks_tmp.clear();
+            handleNewClause(phase+1,model_idx,0,abs,conflict_out,marks_tmp);
             
-            bool res = layers[target_layer_out+1]->insertModuloSubsumption(conflict_out);
-            assert(res);
-            clauses_strengthened += layers[target_layer_out+1]->subsumed_cnt;
-            
-            //into solvers
+            CWBox *clbox = new CWBox(abs,conflict_out);
+            clbox->integrate(&layers[phase+1]);           
+          } else {
+            // TODO: for uniformity's sake, we can have this layer ready as well             
+            if (target_layer_out == phase) // there is a possibility of learning a clause that would minimally belong to a layer that doesn't exist yet              
+              target_layer_out = phase-1;  // we put it into the previous and a later push will move it further            
+            // this is only correct, because the clause in question is in a sense "overgeneralized" - (real obligations, which need to be killed, never sit further than in L_{phase})
+                                   
             marks_tmp.clear();
             marks_tmp.push(target_layer_out+1);            
-            insertIntoSolvers(target_layer_out+1,target_layer_out,conflict_out,marks_tmp);          
-          }
-                                                                     
-          // THIS IS THE RESCHEDULING PART (we could even keep them longer, but they should die eventually, shouldn't they?):
-          ob->idx++;
-          if (opt_resched && 
-             ob->idx < phase &&
-             !learned_univ // obligation that gives rise to an universal clause is doomed to fail ever on (CAREFUL: unless it learns some other rule instead)
-             ) {
-            obligations.push(ob);            
-          } else {
-            releaseObligation(ob);    
-          }
+            handleNewClause(target_layer_out+1,model_idx,0,abs,conflict_out,marks_tmp);
+            
+            CWBox *clbox = new CWBox(abs,conflict_out);
+            clbox->integrate(&layers[target_layer_out+1]);
+  
+            CWBox *prbox = new CWBox();
+            prbox->integrate(&push_requests[target_layer_out+1]);
+            
+            clbox->other = prbox;
+            prbox->other = clbox;            
+          }                   
+
+          // Experiment temporary - very stupid repetition test:
+          for (int i = 1; i < phase; i++)
+            if (layers[i] == 0) {
+              printf("// UNSAT: repetition detected!\n");
+              if (opt_verbose)
+                printf("// Delta-layer %d emptied by subsumption!\n",i);            
+              return true;              
+            }
         }
       }
-    }   
-    return false;    
+    }     
   }
-
-  vec<Lit> initial_ma;
-  
+   
   void iterativeSearch() {
-    assert(initial_ma.size() == 0);
-    initial_ma.push(mkLit(2*sigsize,  true)); // not (L_initial)            
+    assert(initial_obligation.ma.size() == 0);
+    initial_obligation.depth = 0;
+    initial_obligation.ma.push(mkLit(2*sigsize,  true)); // not (L_initial)            
     
-    layers.push(new JustClauseSet());  // the inducive layer
+    layers.push();      // the inducive layer    
+    obligations.push(); // those surviving till next phase 
     
     clock_StartCounter(clock_MAIN);
-
-    least_affected_layer = 1;
     
-    for (phase = 0; ; phase++) {           
-      JustClauseSet* inducive_layer = layers.last();
-      layers[phase] = new JustClauseSet();         
-      layers.push(inducive_layer);
+    for (phase = 0; ; phase++) {
+      layers.push();                             // place for the new layer                  
+      if (layers[phase])                          // inductive layer non-empty ?
+        layers[phase]->relocate(&layers[phase+1]);  // shift it by one and make the phase-th one empty
+      
+      assert(layers[phase] == 0);      
+
+      obligations.push();      // the zero-th will be always empty: obligation at index i, has its ma inside L_i
+      push_requests.push();
+      witnesses.push();
       
       solvers.push(new MarkingSolver());      
-      MarkingSolver &solver = *solvers.last();
-            
+      MarkingSolver &solver = *solvers.last();            
       solver.initilazeSignature(2*sigsize+1);      
-        
+              
       vec<int> marker; /*empty*/
       
       for (int i = 0; i < rest_clauses.size(); i++)
         solver.addClause(rest_clauses[i],marker);
       
       // insert from univs
-      for (JustClauseSet::Iterator it = inducive_layer->getIterator(); it.isValid(); it.next())       
-        solver.addClause(it.getClause(),marker);           
+      for (CWBox* layer_box = layers[phase+1]; layer_box != 0; layer_box = layer_box->next)           
+        solver.addClause(layer_box->data,marker);
 
       if (phase == 0) {
         marker.push(0); // but 0-th layer will remain empty
@@ -836,83 +1079,27 @@ struct SolvingContext {
         // in fact, this is just the single literal single clause
         for (int i = 0; i < goal_clauses.size(); i++)
           solver.addClause(goal_clauses[i],marker);
-      } else {
-        // here we do the pushing               
-        vec<Lit> assumps;
-                
-        for (int i = least_affected_layer; i < phase; i++) {
-          JustClauseSet& push_layer = *layers[i];          
-
-          for (JustClauseSet::Iterator it = push_layer.getIterator(); it.isValid(); ) {                     
-            vec<Lit>const & clause = it.getClause();
-            
-            assumps.clear();
-            for (int l = 0; l < clause.size(); l++) {
-              assert(var(clause[l]) >= sigsize);
-              assumps.push(mkLit(var(clause[l])-sigsize,!sign(clause[l])));
-            }
-            assumps.push(mkLit(2*sigsize, false));
-                                   
-            if (callSolver(i,assumps,clock_SOLVER_PUSH,false,false)) {  //move on
-              it.next();
-            } else {  // push forward 
-              //could it sometimes happen that we can push a stronger version? (e.g. the conflict guy would be a proper subset?) Test it!
-            
-              marks_tmp.clear();
-              marks_tmp.push(i+1);
-            
-              clauses_pushed++;      
-            
-              solvers[i+1]->addClause(clause,marks_tmp); //TODO: could also put into previous layers with this "weaker" marker                                        
-              layers[i+1]->insertModuloSubsumption(clause);
-              
-              clauses_pushsubsumed += layers[i+1]->subsumed_cnt;
-              
-              it.remove();
-            }
-          }
-
-          if (push_layer.size() == 0) {
-            printf("// UNSAT: repetition detected!\n");
-            if (opt_verbose)
-              printf("// Delta-layer %d emptied!\n",i);            
-            return;
-          }
-        } 
-        
-        least_affected_layer = phase;
       }
-
-      if (opt_verbose && opt_pphase)
-        printStatPushing(true);
       
       if (!solver.simplify()) {
         printf("// UNSAT: unconditionally solved by unit propagation!\n");
         return;
       }
-
+           
       if (opt_pphase) {
         printf("\n------------------------------------------------------------------\n");        
         printf("// Starting phase %d...",phase);                
         printf("\n------------------------------------------------------------------\n");        
-      }                 
+      } 
       
-      if (phase >= opt_startphase) {
-        Obligation *ob = acquireObligation();      
-        ob->idx = phase;
-        ob->depth = 0; 
-        initial_ma.copyTo(ob->ma);
-
-        assert(obligations.size() == 0);
-               
-        obligations.push(ob);
-                             
+      if (phase >= opt_startphase) {                                   
         if (processObligations())
           return; // problem solved                 
       }
-      
-      if (opt_verbose && opt_pphase)
-        printStatExtending(true);        
+                  
+      if (opt_verbose && opt_pphase) {
+        printStat(true);                
+      }
       
       if (opt_phaselim && phase >= opt_phaselim) {
         printf("// UNRESOLVED: phase limit reached!\n");
@@ -1149,44 +1336,41 @@ static void SIGINT_exit(int signum) {
   _exit(1); 
 }
 
-void testJustClauseSet() {
-  JustClauseSet cs;  
-  vec<Lit> cl;
-
-  int call = 0;
+/*
+void testCWBox() {
+  CWBox* top = 0;
+  CWBox* a;
+  CWBox* b;
+  CWBox* c;
   
-  for (int k = 0; k < 5; k++) {
-    cl.clear();
-    for (int l = 0; l < 4; l++)
-      cl.push(toLit(rand() & 7));
+  vec<Lit> clause;
+  clause.push(mkLit(0));
   
-    sort(cl);
-    Lit p; int i, j;
-    for (i = j = 0, p = lit_Undef; i < cl.size(); i++)
-      if (cl[i] == ~p)
-        goto next_clause;
-      else if (cl[i] != p)
-        cl[j++] = p = cl[i];
-    cl.shrink(i - j);          
+  a = new CWBox(clause);
     
-    printf("Call (%d) - inserting: ",++call); printLits(cl);   
-                
-    cs.insertModuloSubsumption(cl);       
-    cs.visualize();        
-    next_clause: ;
-  }
+  clause[0] = mkLit(1);
+  b = new CWBox(clause);
   
-  JustClauseSet::Iterator it1 = cs.getIterator();
-  //it1.next();
-  it1.remove();
-  cs.visualize();
+  clause[0] = mkLit(2);
+  c = new CWBox(clause);
   
-  JustClauseSet::Iterator it2 = cs.getIterator();
-     
-  it2.remove();
+  printf("Integrate c: ");  
+  c->integrate(&top);  
+  printCWBox(top);
   
-  cs.visualize();
+  printf("Integrate b: ");  
+  b->integrate(&top);  
+  printCWBox(top);  
+  
+  printf("Integrate a: ");  
+  a->integrate(&top);  
+  printCWBox(top);  
+  
+  printf("Disintegrate a: ");  
+  a->disintegrate();  
+  printCWBox(top);  
 }
+*/
 
 int main(int argc, char** argv)
 {
@@ -1199,7 +1383,7 @@ int main(int argc, char** argv)
         // printf("WARNING: for repeatability, setting FPU to use double precision\n");
 #endif
 
-    //testJustClauseSet();
+    //testCWBox();
     //return 0;
 
     clock_Init();
