@@ -45,6 +45,8 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 
 using namespace Minisat;
 
+static StringOption opt_format  ("INPUT", "format", "Input format: currently either <aiger> or <dimspec>. Default <aiger>.", "aiger");
+
 static BoolOption opt_verbose     ("PARSE", "v", "Verbose output.", true);
 static BoolOption opt_pphase     ("MAIN", "pphase", "Print phase.", false);
 
@@ -60,8 +62,6 @@ static IntOption opt_phaselim ("MAIN", "phaselim", "Terminate after a given numb
 
 // TODO: should try handling obligations queue-wise (currently is stack-wise) - longer model paths have preference ...
 static BoolOption opt_earlystop ("MAIN", "earlystop", "Don't put weak clauses into strong layers.", true); // seems to be a good idea after all
-static BoolOption opt_subskills ("MAIN", "subskills", "Subsumption kills obligations for good.", false);   // not a good idea overall 
-static BoolOption opt_survive ("MAIN", "survive", "Obligations survive between phases.", false);           // helps for easy guys 
 
 static IntOption opt_resched ("MAIN", "resched", "Reschedule obligations (allows long models).", 1, IntRange(0,3));
 
@@ -122,14 +122,16 @@ ABSTRACTION_TYPE calcAbstraction(vec<Lit> const & data) {
 
 //=================================================================================================
 
+
 struct Obligation {
   int depth;
   
-  vec<Lit> ma;
-  ABSTRACTION_TYPE abs; // abstraction of the above
+  Obligation *next; // used for parent pointers for active obligations (which is later used for reconstructing the witness)
   
-  void copyTo(Obligation& copy) const { copy.depth = depth; copy.abs = abs; ma.copyTo(copy.ma); }
-  void moveTo(Obligation& dest)       { dest.depth = depth; dest.abs = abs; ma.moveTo(dest.ma); }  
+  vec<Lit> ma;
+  ABSTRACTION_TYPE abs; // abstraction of the above   
+  
+  Obligation(int d, Obligation* n) : depth(d), next(n) {}
 };
 
 static int ids = 0;
@@ -215,12 +217,15 @@ struct CBoxVec {
   }  
 };
 
-struct SolvingContext {
+struct SolvingContext {  
   Lit goal_lit;
+  bool artificial_goal_var;
   int sigsize;
 
   Clauses goal_clauses;
   Clauses rest_clauses;
+  
+  Clauses model_path;  // filled in at the end in the case of SAT (i-th element with satisfy L_i, in particulat the 0-th state will be the goal state)
   
   vec<bool> bridge_variables; 
   // TODO: this idea should be extended up to the point where the low signature part of the solver is only as big as the bridge (the rest of the variables are just rubbish!)
@@ -234,7 +239,7 @@ struct SolvingContext {
   CBoxVec push_requests;  // and here
   CBoxVec witnesses;      //  or here their respective bros
    
-  vec< vec<Obligation> > obligations;
+  vec< vec<Obligation*> > obligations;
         
   // statistics
   int pushing_request;
@@ -250,9 +255,7 @@ struct SolvingContext {
   
   int clauses_dersolver;
   int clauses_univ;
-  int clauses_strengthened;  
-     
-  
+  int clauses_strengthened;         
      
   int solver_call_extension;
   int solver_call_push;
@@ -273,7 +276,8 @@ struct SolvingContext {
                      solver_call_extension(0), solver_call_push(0),                     
                      minim_attempts(0), minim_solver(0), minim_explicit(0), minim_inductively(0), minim_push(0),
                      model_min_layer(0), model_max_depth(0),                       
-                     called(0)
+                     called(0),
+                     initial_obligation(0,0)
   { }    
 
   void deleteClause(CWBox *cl_box) {
@@ -289,6 +293,10 @@ struct SolvingContext {
     if (opt_verbose)
       printGOStat();      
 
+    for (int i = 0; i < obligations.size(); i++)
+      for (int j = 0; j < obligations[i].size(); j++)
+        delete obligations[i][j];
+      
     for (int i = 0; i < layers.size(); i++)
       while (layers[i])
         deleteClause(layers[i]);
@@ -355,7 +363,7 @@ struct SolvingContext {
     }       
     
     if (opt_minimize && opt_sminim) {
-      printf("\nMinimzation averages from %d attempts:\n", minim_attempts);
+      printf("\nMinimization averages from %d attempts:\n", minim_attempts);
       printf("\t%f by solver,\n",(1.0*minim_solver)/minim_attempts);      
       printf("\t%f by picking (%f from inducive passes),\n",(1.0*minim_explicit)/minim_attempts,(1.0*minim_inductively)/minim_attempts);
       printf("\t%f by pushing.\n",(1.0*minim_push)/minim_attempts);
@@ -384,7 +392,7 @@ struct SolvingContext {
       }
       printf("\n");
       
-      printf("Avg sz: : ");           
+      printf("Avg sz: ");           
       for (int i = 0; i <= phase+1; i++) {
         int sz = 0;
         int lensum = 0;
@@ -462,8 +470,10 @@ struct SolvingContext {
       
   static const int inductive_layer_idx; 
   
-  vec<Lit> ma_tmp;
   vec<int> marks_tmp;
+  
+  // INPUT for callSolver()
+  vec<Lit> filtered_ma;        // ma without non-bridge variables
   
   // OUTPUT from callSolver()
   vec<Lit> conflict_out;
@@ -476,34 +486,25 @@ struct SolvingContext {
    
   int called; 
    
-  bool callSolver(int idx, vec<Lit> &ma, CLOCK_CLOCKS cc,  // calls the idx-th solver, under then give assumptions ma plus the layer assumptions
-                  bool compute_conflict,                   // request for returning (minimized, if flag set) appropriate conflict clause (to be delivered in conflict_out), 
-                                                           // also, target_layer_out will containt index of the least delta layer on which the conflict depends (or inductive_layer_idx for "infty")
-                  bool induction) {                        // allow using induction during minimization
+  bool callSolver(int idx, CLOCK_CLOCKS cc,       // calls the idx-th solver, under then give assumptions filtered_ma plus the layer assumptions
+                  bool compute_conflict,          // request for returning (minimized, if flag set) appropriate conflict clause (to be delivered in conflict_out), 
+                                                  // also, target_layer_out will containt index of the least delta layer on which the conflict depends (or inductive_layer_idx for "infty")
+                  bool induction) {               // allow using induction during minimization
                                                            
 
     MarkingSolver& solver = *solvers[idx];
 
-    //printf("Calling for solver %d with ma ",idx); printLits(ma);
+    //printf("Calling for solver %d with ma ",idx); printLits(filtered_ma);
                  
     clock_StopAddPassedTime(clock_MAIN);
-    clock_StartCounter(cc);
-
-    ma_tmp.clear();
-    for (int i = 0; i < ma.size(); i++) {
-      assert(var(ma[i]) >= sigsize);
-      if (var(ma[i]) < 2*sigsize)
-        ma_tmp.push(mkLit(var(ma[i])-sigsize,!sign(ma[i])));
-      else 
-        ma_tmp.push(ma[i]);
-    }
+    clock_StartCounter(cc);   
     
     minimark_in.clear();
     for (int i = idx; i <= phase; i++)
       minimark_in.push(i);
     minimark_in.push(inductive_layer_idx); 
     
-    solver.preprocessAssumptions(ma_tmp,minimark_in);    
+    solver.preprocessAssumptions(filtered_ma,minimark_in);    
     bool result = (solver.simplify(),solver.solve());
     
     if (!result && compute_conflict) {
@@ -512,7 +513,7 @@ struct SolvingContext {
       if (opt_minimize) {
         minim_attempts++;
       
-        minim_solver += ma_tmp.size() - conflict_out.size();
+        minim_solver += filtered_ma.size() - conflict_out.size();
                                  
         //turn the conflict clause back to assumptions
         for (int i = 0; i < conflict_out.size(); i++)
@@ -616,7 +617,7 @@ struct SolvingContext {
         conflict.push(~conflict_out[i]);      
       sort(conflict);
                           
-      assert(subsumes(conflict,ma_tmp));                
+      assert(subsumes(conflict,filtered_ma));                
       
       //part two
       MarkingSolver test_solver;
@@ -701,12 +702,15 @@ struct SolvingContext {
     if (from > phase)
       return 0;
 
+    if (relocate_to > phase+1)
+      relocate_to = phase+1;
+      
     int res = 0;
-    vec<Obligation> & obligs = obligations[from];
+    vec<Obligation*> & obligs = obligations[from];
     
     int i,j;
     for (i=0, j=0; i < obligs.size(); i++) {
-      vec<Lit> &ma = obligs[i].ma;
+      vec<Lit> &ma = obligs[i]->ma;
             
       assert(clause_sorted(ma));
     
@@ -714,21 +718,16 @@ struct SolvingContext {
       // this subsumption check only ever works because goal_lit is part of the bridge
       // (and all the generated ma's don't satisfy the goal -- otherwise we would terminate with SAT)
       
-      if (absSubsumes(abs,obligs[i].abs) && subsumes(clause,ma)) {
+      if (absSubsumes(abs,obligs[i]->abs) && subsumes(clause,ma)) {
         res++;
         
-        if (!opt_subskills && opt_resched && relocate_to <= phase+(opt_survive ? 1 : 0)) { 
-          obligations[relocate_to].push();                   
-          obligs[i].moveTo(obligations[relocate_to].last());
-          
+        if (opt_resched) { 
+          obligations[relocate_to].push(obligs[i]);          
           oblig_resched_subs++;                                         
-        } else ; // killing him is for free
-      } else {
-        // keeping it here
-        if (j < i)
-          obligs[i].moveTo(obligs[j]);
-        j++;
-      }
+        } else
+          delete obligs[i];
+      } else  // keeping it here
+        obligs[j++] = obligs[i];                    
     }
     obligs.shrink(i-j);
   
@@ -799,25 +798,23 @@ struct SolvingContext {
     
     //printf("Killed %d, went %d steps deep and subsumed %d obligations\n",sum_cl_killed,target_layer-stopped,sum_ob_pushed);    
   }
-  
-  vec<Lit> assumps;
-  
+      
   void lookForWitness(CWBox * cl_box, int index) {
     vec<Lit> & clause = cl_box->data;
-
-    assumps.clear();
-    for (int l = 0; l < clause.size(); l++) {
-      assert(var(clause[l]) >= sigsize);
-      assumps.push(clause[l]);
-    }
-    assumps.push(mkLit(2*sigsize, false));
-
+   
     solver_call_push++;    
     pushing_request++;
     if (cl_box->other->data.size())
       pushing_nontriv_request++;
+      
+    filtered_ma.clear();
+    for (int l = 0; l < clause.size(); l++) {
+      assert(var(clause[l]) >= sigsize);
+      filtered_ma.push(mkLit(var(clause[l])-sigsize,!sign(clause[l])));      
+    }
+    filtered_ma.push(mkLit(2*sigsize, false));                   
     
-    if (callSolver(index,assumps,clock_SOLVER_PUSH,false,false)) {
+    if (callSolver(index,clock_SOLVER_PUSH,false,false)) {
       MarkingSolver &model_solver = *solvers[index];      
       
       // extract the witness
@@ -849,7 +846,7 @@ struct SolvingContext {
   
   Obligation initial_obligation;
   
-  bool processObligations() {      
+  bool processObligations() {
     int obl_top = phase + 1;  // the lowest index where there is possibly any obligation to look for    
   
     for (;;) {
@@ -872,19 +869,19 @@ struct SolvingContext {
       }
       
       // now handle obligations
-      Obligation ob;
+      Obligation* ob;
       while (obl_top <= phase && obligations[obl_top].size() == 0)
         obl_top++;      
         
       if (obl_top > phase) {
-        initial_obligation.copyTo(ob);
+        ob = &initial_obligation;        
       } else {
-        obligations[obl_top].last().moveTo(ob);
+        ob = obligations[obl_top].last();        
         obligations[obl_top].pop();
-      }        
+      }
 
       int model_idx = obl_top-1;
-      vec<Lit> &our_ma = ob.ma;         
+      vec<Lit> &our_ma = ob->ma;         
 
       oblig_processed++;
 
@@ -893,26 +890,31 @@ struct SolvingContext {
       if (model_idx < model_min_layer)
         model_min_layer = model_idx;
     
-      if (ob.depth > model_max_depth)
-        model_max_depth = ob.depth;
+      if (ob->depth > model_max_depth)
+        model_max_depth = ob->depth;
 
       solver_call_extension++;
-               
-      if (callSolver(model_idx,our_ma,clock_SOLVER_EXTEND,
+    
+      filtered_ma.clear();
+      for (int i = 0; i < our_ma.size(); i++) {
+        assert(var(our_ma[i]) >= sigsize);
+        if (var(our_ma[i]) < 2*sigsize) { 
+          if (bridge_variables[var(our_ma[i])-sigsize])
+            filtered_ma.push(mkLit(var(our_ma[i])-sigsize,!sign(our_ma[i])));
+        } else 
+          filtered_ma.push(our_ma[i]);               
+      }
+        
+      if (callSolver(model_idx,clock_SOLVER_EXTEND,
                     true,                                  // return conflict
-                    obl_top>=phase )                       // induction is not correct for the initial call
+                    obl_top<=phase )                       // induction is not correct for the initial call
                     ) {
-        oblig_sat++;
-      
-        if (model_idx == 0) {
-          printf("// SAT: model of length %d found\n",ob.depth+1);                   
-          return true;
-        }
+        oblig_sat++;             
 
         //printf("Extended\n");
         
         // going forward        
-        Obligation new_ob;
+        Obligation* new_ob = new Obligation(ob->depth+1,ob);
         int new_top;
         
         if (opt_resched == 3)
@@ -920,37 +922,58 @@ struct SolvingContext {
         else if (opt_resched == 2)
           new_top = (model_idx == 1) ? 1 : model_idx-1; // a little forward
         else
-          new_top = model_idx;
-        
-        new_ob.depth = ob.depth+1;
+          new_top = model_idx;               
 
+        // printf("%d points to %d\n",new_ob->id,ob->id);
+        
         MarkingSolver &model_solver = *solvers[model_idx];
         
-        vec<Lit>& ma = new_ob.ma;
+        vec<Lit>& ma = new_ob->ma;
         ma.clear();
         for (int j = 0; j < sigsize; j++) {
-          assert(model_solver.model[j+sigsize] != l_Undef);    
-          if (bridge_variables[j])          
-            ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));
-        }
+          assert(model_solver.model[j+sigsize] != l_Undef); 
+          // normally, the bridgevar trick would go here, but we need to keep the whole model for printing
+          ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));
+        }                                            
         // only after the previous, so that it is sorted
         ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses
-        new_ob.abs = calcAbstraction(ma);
+        new_ob->abs = calcAbstraction(ma);
 
-        if (ob.depth > 0) {  //otherwise it is just the initial guy which is handled differently
-          obligations[obl_top].push();
-          ob.moveTo(obligations[obl_top].last());
-        }
+        if (ob->depth > 0)   // the initial guy is never stored
+          obligations[obl_top].push(ob);
+        obligations[new_top].push(new_ob);
+        
+        obl_top = new_top; // follow him forward       
                 
-        obligations[new_top].push();
-        new_ob.moveTo(obligations[new_top].last());
-        
-        obl_top = new_top; // follow him forward
-        
+        if (model_idx == 0) {          
+          printf("// SAT: model of length %d found:\n",ob->depth+1);
+
+          Obligation* top_ob = new_ob;
+          do {
+            assert(top_ob);
+            model_path.push();
+            vec<Lit> & in_ma = top_ob->ma;
+            vec<Lit> & out_ma = model_path.last();            
+            for (int i = 0; i < in_ma.size(); i++) {
+              assert(var(in_ma[i]) >= sigsize);                    
+              if (var(in_ma[i]) < 2*sigsize)
+                out_ma.push(mkLit(var(in_ma[i])-sigsize,!sign(in_ma[i])));
+              else 
+                out_ma.push(in_ma[i]);               
+            }            
+            
+            top_ob = top_ob->next;
+          } while (top_ob->depth > 0);
+          
+          assert(top_ob);
+          assert(top_ob == &initial_obligation); //this one doesn't go in any more
+          
+          return true;                
+        }        
       } else {  //unsat                             
         oblig_unsat++;
         
-        if (ob.depth == 0) { //"base level conflict"
+        if (ob->depth == 0) { //"base level conflict"
           assert(conflict_out.size() <= 1); //only possibly the initial marker         
           
           if (conflict_out.size() == 0 || target_layer_out == inductive_layer_idx) {
@@ -967,18 +990,24 @@ struct SolvingContext {
             return true;
           }
 
+          //delete obligations pushed to death
+          for (int i = 0; i < obligations[phase+1].size(); i++)
+            delete obligations[phase+1][i];
+          obligations[phase+1].clear();
+          
           return false;
 
         } else { // regular conflict        
           clauses_dersolver++;
           
           // THIS IS THE RESCHEDULING PART (we could even keep them longer, but they should die eventually, shouldn't they?):
-          if (opt_resched && obl_top < phase + (opt_survive ? 1 : 0)) {
-            obligations[obl_top+1].push();
-            ob.moveTo(obligations[obl_top+1].last());
-            
+          // CAREFUL we do rescheduling even before handling the clause, so that in case of generalization even this pushed ob will get killed
+          if (opt_resched) {
+            assert(obl_top <= phase);
+            obligations[obl_top+1].push(ob);           
             oblig_resched_clause++;
-          } // CAREFUL we do rescheduling even before handling the clause, so that in case of generalization even this pushed ob will get killed
+          } else 
+            delete ob;                   
           
           // convert the conflict to the upper signature and possibly remove the step marker
           int i,j;      
@@ -1041,8 +1070,7 @@ struct SolvingContext {
    
   void iterativeSearch() {
     assert(initial_obligation.ma.size() == 0);
-    initial_obligation.depth = 0;
-    initial_obligation.ma.push(mkLit(2*sigsize,  true)); // not (L_initial)            
+    initial_obligation.ma.push(mkLit(2*sigsize,  true)); // not (L_initial)                 
     
     layers.push();      // the inducive layer    
     obligations.push(); // those surviving till next phase 
@@ -1128,153 +1156,219 @@ static void prepareClause(vec<Lit>& clause_out, const vec<Lit> &clause_in, int s
     clause_out.push(litToAdd);       
 }
 
+static void verifyStep(int sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step, vec<bool>& cur_model, vec<bool>& prev_model, int idx, bool last) { 
+  if (!opt_reversed && idx == 0 || opt_reversed && last) { // check initial
+    for (int i = 0; i < initial.size(); i++) {
+      for (int j = 0; j < initial[i].size(); j++) 
+        if (cur_model[var(initial[i][j])] != sign(initial[i][j]))
+          goto next_initial_clause;
+      
+      printf("Initial clause UNSAT: "); printLits(initial[i]);
+      assert(false);
+            
+      next_initial_clause: ;
+    }            
+  }
+
+  if (!opt_reversed && last || opt_reversed && idx == 0) { // check goal
+    for (int i = 0; i < goal.size(); i++) {
+      for (int j = 0; j < goal[i].size(); j++) 
+        if (cur_model[var(goal[i][j])] != sign(goal[i][j]))
+          goto next_goal_clause;
+            
+      printf("Goal clause UNSAT: "); printLits(goal[i]);
+      assert(false);
+            
+      next_goal_clause: ;
+    }            
+  }
+  
+  // check universal
+  {
+    for (int i = 0; i < universal.size(); i++) {
+      for (int j = 0; j < universal[i].size(); j++) 
+        if (cur_model[var(universal[i][j])] != sign(universal[i][j]))
+          goto next_universal_clause;
+            
+      printf("Universal clause UNSAT: "); printLits(universal[i]);
+      assert(false);
+            
+      next_universal_clause: ;
+    }
+  }
+  
+  // check step
+  if (idx > 0) {
+    for (int i = 0; i < step.size(); i++) {
+      for (int j = 0; j < step[i].size(); j++)
+        if (var(step[i][j]) < sigsize) {
+          if (!opt_reversed && prev_model[var(step[i][j])] != sign(step[i][j]) || 
+               opt_reversed && cur_model[var(step[i][j])] != sign(step[i][j]))
+            goto next_step_clause;
+        } else {
+          if (!opt_reversed && cur_model[var(step[i][j])-sigsize] != sign(step[i][j]) ||
+               opt_reversed && prev_model[var(step[i][j])] != sign(step[i][j]))
+            goto next_step_clause;        
+        }
+                      
+      printf("Step clause UNSAT: "); printLits(step[i]);
+      assert(false);
+            
+      next_step_clause: ;
+    }   
+  }  
+}
+
 static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
   SolvingContext& context = *global_context;
   
   Lit goal_lit = lit_Undef;
      
   clock_StartCounter(clock_SIMP);      
-      
-  { // preprocessing    
-    int new_sigsize;
-    SimpSolver simpSolver;
-    vec<Lit> cur_clause;
-    
-    //TODO: play with these guys -- and with other params if you wish...    
-    //simpSolver.use_asymm = true;
-    //simpSolver.grow = 10;
-    
-    // 0,1,...,sigsize-1           the basic signature
-    // sigsize,...,2*sigsize-1     the primed signature
-    // 2*sigsize                   the initial marker 
-    // 2*sigsize+1                 the goal marker
-    for (int j = 0; j < 2*sigsize+2; j++)
-      simpSolver.newVar();
-  
-    // initial clauses
-    for (int j = 0; j < initial.size(); j++) {   
-      prepareClause(cur_clause,initial[j],sigsize,true,mkLit(2*sigsize));  // marked as initial    
-      simpSolver.addClause(cur_clause);
-    }
-    
-    assert(goal.size() == 1);
-    assert(goal[0].size() == 1);    
-    
-    // goal clauses
-    for (int j = 0; j < goal.size(); j++) {
-      prepareClause(cur_clause,goal[j],sigsize,true,mkLit(2*sigsize+1));   // marked as goal (second literal is needed! otherwise minisat kills the opposite literal when the unit goal is inserted)
-      
-      goal_lit = goal[0][0];           
-      goal_lit = mkLit(var(goal_lit)+sigsize,sign(goal_lit));
-      //printf("Goal lit: "); printLit(goal_lit); printf("\n");
-      
-      simpSolver.addClause(cur_clause);
-    }
-    assert(goal_lit != lit_Undef);
-    
-    // universal clauses
-    for (int j = 0; j < universal.size(); j++) {    
-      prepareClause(cur_clause,universal[j],sigsize,true);  //universals are unmarked
-      simpSolver.addClause(cur_clause);
-    }
-    
-    // step clauses    
-    for (int j = 0; j < step.size(); j++) {
-      prepareClause(cur_clause,step[j],0,false,mkLit(2*sigsize,true));  // marked as incompatible with initial
-      simpSolver.addClause(cur_clause);
-    }
-      
-    // freeze the markers, and all variables from lower signature
-    simpSolver.setFrozen(2*sigsize,true);
-    simpSolver.setFrozen(2*sigsize+1,true);
-    simpSolver.setFrozen(var(goal_lit),true);
-    for (int i = 0; i < sigsize; i++) // don't eliminate lower signature variables (it is trivial, and it spoils the statistics)
-      simpSolver.setFrozen(i,true);    
-    for (int j = 0; j < step.size(); j++)
-      for (int i = 0; i < step[j].size(); i++)
-        if (var(step[j][i])<sigsize) {
-          simpSolver.setFrozen(var(step[j][i]),true); // here we do it again, but who cares
-          simpSolver.setFrozen(var(step[j][i])+sigsize,true); //and this is the important part
-        }
         
-    int before = simpSolver.nClauses();    // in fact, we don't see the number of unit clauses here !!!
-         
-    if (opt_elimination ? !simpSolver.eliminate(true) : !simpSolver.simplify()) {
-      printf("// UNSAT: solved by variable elimantion!\n");
-      
-      clock_StopPassedTime(clock_SIMP);
-      return;
-    }
-    //printf("eliminated_vars: %d\n",simpSolver.eliminated_vars);
-    //printf("sub_subsumed: %d\n",simpSolver.sub_subsumed);
-    //printf("sub_deleted_literals: %d\n",simpSolver.sub_deleted_literals);
-    //printf("asymm_lits: %d\n",simpSolver.asymm_lits);
-    
-    Clauses simpClauses;
-    simpSolver.copyOutClauses(simpClauses);
-    
-    int new_var_count = 0;
-    vec<Var> renaming;
-    
-    vec<bool>& bridge_variables = context.bridge_variables;    
-    
-    for (int i = sigsize; i < 2*sigsize+2; i++) { // the two markers didn't get eliminated!
-      renaming.push();
-      
-      if (!simpSolver.isEliminated(i)) { // the goal_lit goes in as well, that's why ma_subsumption testing works!
-        bridge_variables.push(simpSolver.isFrozen(i));
-        renaming.last() = new_var_count++;
-      } else
-        renaming.last() = var_Undef;  
-    }
-    
-    new_sigsize = new_var_count - 2; //the two markers don't count
-    context.sigsize = new_sigsize;
-    
-    if (opt_verbose) {
-      printf("// Eliminated %d variables -- new sigsize: %d.\n",simpSolver.eliminated_vars,new_sigsize);
-      printf("// Simplified from %d to %d clauses.\n",before,simpSolver.nClauses());          
-    }
-    
-    for (int i = 0; i < simpClauses.size(); i++ ) {
-      vec<Lit>& clause = simpClauses[i];
+  int new_sigsize;
+  SimpSolver simpSolver;
+  vec<Lit> cur_clause;
+  
+  //TODO: play with these guys -- and with other params if you wish...    
+  //simpSolver.use_asymm = true;
+  //simpSolver.grow = 10;
+  
+  // 0,1,...,sigsize-1           the basic signature
+  // sigsize,...,2*sigsize-1     the primed signature
+  // 2*sigsize                   the initial marker 
+  // 2*sigsize+1                 the goal marker
+  for (int j = 0; j < 2*sigsize+2; j++)
+    simpSolver.newVar();
 
-      int j,k;
-      bool goal = false;
-      
-      for (j = 0, k = 0; j < clause.size(); j++) {
-        Lit l = clause[j];
-        Var v = var(l);
-
-        if (v == 2*sigsize+1) { // we remeber it, but newly don't keep explicitly anymore (will later use MarkingSolver instead)
-          assert(!sign(l));
-          goal = true;
-        } else {
-          clause[k++] = l;
-        }
-      }
-      clause.shrink(j-k);  //one literal potentially missing            
-
-      // apply the renaming
-      for (int j = 0; j < clause.size(); j++) {
-        Lit l = clause[j];
-        Var v = var(l);
-
-        if (v < sigsize)
-          clause[j] = mkLit(renaming[v],sign(l));
-        else {
-          clause[j] = mkLit(renaming[v-sigsize]+new_sigsize,sign(l));          
-        }            
+  // initial clauses
+  for (int j = 0; j < initial.size(); j++) {   
+    prepareClause(cur_clause,initial[j],sigsize,true,mkLit(2*sigsize));  // marked as initial    
+    simpSolver.addClause(cur_clause);
+  }
+  
+  assert(goal.size() == 1);
+  assert(goal[0].size() == 1);    
+  
+  // goal clauses
+  for (int j = 0; j < goal.size(); j++) {
+    prepareClause(cur_clause,goal[j],sigsize,true,mkLit(2*sigsize+1));   // marked as goal (second literal is needed! otherwise minisat kills the opposite literal when the unit goal is inserted)
+    
+    goal_lit = goal[0][0];           
+    goal_lit = mkLit(var(goal_lit)+sigsize,sign(goal_lit));
+    //printf("Goal lit: "); printLit(goal_lit); printf("\n");
+    
+    simpSolver.addClause(cur_clause);
+  }
+  assert(goal_lit != lit_Undef);
+  
+  // universal clauses
+  for (int j = 0; j < universal.size(); j++) {    
+    prepareClause(cur_clause,universal[j],sigsize,true);  //universals are unmarked
+    simpSolver.addClause(cur_clause);
+  }
+  
+  // step clauses    
+  for (int j = 0; j < step.size(); j++) {
+    prepareClause(cur_clause,step[j],0,false,mkLit(2*sigsize,true));  // marked as incompatible with initial
+    simpSolver.addClause(cur_clause);
+  }
+    
+  // freeze the markers, and all variables from lower signature
+  simpSolver.setFrozen(2*sigsize,true);
+  simpSolver.setFrozen(2*sigsize+1,true);
+  simpSolver.setFrozen(var(goal_lit),true);
+  for (int i = 0; i < sigsize; i++) // don't eliminate lower signature variables (it is trivial, and it spoils the statistics)
+    simpSolver.setFrozen(i,true);    
+  for (int j = 0; j < step.size(); j++)
+    for (int i = 0; i < step[j].size(); i++)
+      if (var(step[j][i])<sigsize) {
+        simpSolver.setFrozen(var(step[j][i]),true); // here we do it again, but who cares
+        simpSolver.setFrozen(var(step[j][i])+sigsize,true); //and this is the important part
       }
       
-      //printf("%s clause: ",goal ? "Goal" : "Normal"); printClause(clause);
-      
-      Clauses& target = (goal ? context.goal_clauses : context.rest_clauses);
+  int before = simpSolver.nClauses();    // in fact, we don't see the number of unit clauses here !!!
+       
+  if (opt_elimination ? !simpSolver.eliminate(true) : !simpSolver.simplify()) {
+    printf("// UNSAT: solved by variable elimantion!\n");
+    
+    clock_StopPassedTime(clock_SIMP);
+    return;
+  }
+  //printf("eliminated_vars: %d\n",simpSolver.eliminated_vars);
+  //printf("sub_subsumed: %d\n",simpSolver.sub_subsumed);
+  //printf("sub_deleted_literals: %d\n",simpSolver.sub_deleted_literals);
+  //printf("asymm_lits: %d\n",simpSolver.asymm_lits);
+  
+  Clauses simpClauses;
+  simpSolver.copyOutClauses(simpClauses);
+    
+  vec<Var> renaming;
+  vec<Var> inv_renaming;
+  
+  vec<bool>& bridge_variables = context.bridge_variables;    
+  
+  for (int i = sigsize; i < 2*sigsize+2; i++) { // the two markers didn't get eliminated!
+    renaming.push();
+    
+    if (!simpSolver.isEliminated(i)) { // the goal_lit goes in as well, that's why ma_subsumption testing works!                 
+      renaming.last() = inv_renaming.size();
+      inv_renaming.push(i-sigsize);      
+      bridge_variables.push(simpSolver.isFrozen(i));
+      // printf("%s",simpSolver.isFrozen(i) ? "B" : "*");
+    } else {
+      renaming.last() = var_Undef;        
+      // printf("-");
+    }    
+  }
+  // printf("\n");
+  
+  new_sigsize = inv_renaming.size() - 2; //the two markers don't count
+  context.sigsize = new_sigsize;
+  
+  if (opt_verbose) {
+    printf("// Eliminated %d variables -- new sigsize: %d.\n",simpSolver.eliminated_vars,new_sigsize);
+    printf("// Simplified from %d to %d clauses.\n",before,simpSolver.nClauses());          
+  }
+  
+  for (int i = 0; i < simpClauses.size(); i++ ) {
+    vec<Lit>& clause = simpClauses[i];
 
-      int idx = target.size();
-      target.push();
-      clause.moveTo(target[idx]);            
+    int j,k;
+    bool goal = false;
+    
+    for (j = 0, k = 0; j < clause.size(); j++) {
+      Lit l = clause[j];
+      Var v = var(l);
+
+      if (v == 2*sigsize+1) { // we remeber it, but newly don't keep explicitly anymore (will later use MarkingSolver instead)
+        assert(!sign(l));
+        goal = true;
+      } else {
+        clause[k++] = l;
+      }
     }
+    clause.shrink(j-k);  //one literal potentially missing            
+
+    // apply the renaming
+    for (int j = 0; j < clause.size(); j++) {
+      Lit l = clause[j];
+      Var v = var(l);
+
+      if (v < sigsize)
+        clause[j] = mkLit(renaming[v],sign(l));
+      else {
+        clause[j] = mkLit(renaming[v-sigsize]+new_sigsize,sign(l));          
+      }            
+    }
+    
+    // printf("%s clause: ",goal ? "Goal" : "Normal"); printLits(clause);
+    
+    Clauses& target = (goal ? context.goal_clauses : context.rest_clauses);
+
+    int idx = target.size();
+    target.push();
+    clause.moveTo(target[idx]);            
   }
   
   clock_StopPassedTime(clock_SIMP);
@@ -1288,14 +1382,72 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
   
   //printf("Goal lit: "); printLit(context.goal_lit); printf("\n");
   
-  context.iterativeSearch();
+  context.iterativeSearch();    
+  
+  Clauses& model_path = context.model_path;
+    
+  if (model_path.size() > 0                // the SAT CASE
+       && (strcmp(opt_format,"dimspec") == 0)) {   // and somebody is interested             
+    
+    vec<bool> prev_model;
+    vec<bool> cur_model;
+    int model_idx = 0;
+    
+    printf("solution %d %d\n",sigsize - (context.artificial_goal_var ? 1 : 0),model_path.size());
+     
+    //translate to the original signature and print      
+    for (int i = (opt_reversed ? 0 : model_path.size()-1); 
+                 (opt_reversed ? i <= model_path.size()-1 : i >= 0);
+                 i += (opt_reversed ? 1 : -1)) {
+      vec<Lit> &cur_ma = model_path[i];
+               
+      //clear the model in simpSolver
+      simpSolver.model.clear();
+      simpSolver.model.growTo(simpSolver.nVars());
+      for (int j = 0; j < simpSolver.nVars(); j++)
+        simpSolver.model[j] = l_Undef;     
+  
+      //everything is in lower (except the initial/non-initial markers) -> will go to upper after renaming
+      for (int j = 0; j < cur_ma.size(); j++)
+        if (var(cur_ma[j]) < new_sigsize) {
+          Var v = inv_renaming[var(cur_ma[j])] + sigsize;
+          
+          simpSolver.model[v] = lbool(!sign(cur_ma[j]));
+        }
+        
+      if (i == model_path.size()-1) //the first model of the sequence - turn on initial
+        simpSolver.model[2*sigsize] = l_False;
+            
+      if (i == 0) //the last model of the sequence - turn on goal
+        simpSolver.model[2*sigsize+1] = l_False;      
+  
+      simpSolver.extendModel();
+      bool space = false;
+      cur_model.clear();
+      for (int j = sigsize; j < 2*sigsize; j++) {
+        assert(simpSolver.model[j] != l_Undef);
+        
+        if (!context.artificial_goal_var || j < 2*sigsize-1) {       
+          printf("%s%s%d", (j==sigsize)?"":" ", (simpSolver.model[j]==l_True)?"":"-", j-sigsize+1);
+          space = true;
+        }
+               
+        cur_model.push(simpSolver.model[j]==l_True);        
+      }
+                 
+      printf("%s0\n",space?" ":"");                                               
+      
+      verifyStep(sigsize,initial,goal,universal,step,cur_model,prev_model,model_idx++,(opt_reversed ? i == model_path.size()-1 : i == 0));
+      cur_model.copyTo(prev_model);
+    }
+  }  
 }
 
 //=================================================================================================
 
-void ensure_single_unit_goal(int &sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
+bool ensure_single_unit_goal(int &sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
   if (goal.size() == 1 && goal[0].size() == 1)
-    return;
+    return false;
     
   vec<Lit> cur;
 
@@ -1326,6 +1478,8 @@ void ensure_single_unit_goal(int &sigsize, Clauses &initial, Clauses &goal, Clau
 
   // enlarge the signature:
   sigsize++;
+  printf("// Added 1 variable and 1 clause to represent the goal.\n");  
+  return true;
 }
 
 static void SIGINT_exit(int signum) {
@@ -1399,18 +1553,26 @@ int main(int argc, char** argv)
     parseOptions(argc, argv, true);
   
     clock_StartCounter(clock_PARSE);
-    
-    aiger_LoadSpec((argc == 1) ? 0 : argv[1], (int)opt_reversed, (int)opt_pg, /*no parsing chat*/0, opt_kth_property, (int)false,
-                   sigsize,initial,goal,universal,step);
 
+    if (strcmp(opt_format,"aiger") == 0)
+      aiger_LoadSpec((argc == 1) ? 0 : argv[1], (int)opt_reversed, (int)opt_pg, /*no parsing chat*/0, opt_kth_property, (int)false,
+                   sigsize,initial,goal,universal,step);
+    else if (strcmp(opt_format,"dimspec") == 0)
+      dimacs_LoadSpec((argc == 1) ? 0 : argv[1], opt_reversed, sigsize, initial, universal, goal, step);
+    else {
+      printf("Unknown format: %s!\n",(const char *)opt_format);
+      exit (1);
+    }    
+              
     clock_StopPassedTime(clock_PARSE);
     
     if (opt_verbose)
       printf("// Loaded spec -- sigsize: %d, #initial: %d, #goal: %d, #universal: %d, #step: %d\n",sigsize,initial.size(),goal.size(),universal.size(),step.size());
 
-    ensure_single_unit_goal(sigsize,initial,goal,universal,step);        
+    bool added_new_var = ensure_single_unit_goal(sigsize,initial,goal,universal,step);        
     
     global_context = new SolvingContext();
+    global_context->artificial_goal_var = added_new_var;
     
     signal(SIGINT, SIGINT_exit);
     analyzeSpec(sigsize,initial,goal,universal,step);

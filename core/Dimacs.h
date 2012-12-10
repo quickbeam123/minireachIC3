@@ -26,63 +26,141 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include "utils/ParseUtils.h"
 #include "core/SolverTypes.h"
 
+typedef Minisat::vec< Minisat::vec< Minisat::Lit> > Clauses;
+
 namespace Minisat {
 
-//=================================================================================================
-// DIMACS Parser:
-
-template<class B, class Solver>
-static void readClause(B& in, Solver& S, vec<Lit>& lits) {
-    int     parsed_lit, var;
+static void readClause(StreamBuffer& in, int sigsize, bool large, bool reversed, vec<Lit>& lits) {
+    int parsed_lit, var;
     lits.clear();
     for (;;){
         parsed_lit = parseInt(in);
         if (parsed_lit == 0) break;
         var = abs(parsed_lit)-1;
-        while (var >= S.nVars()) S.newVar();
+        
+        if (var >= (large ? 2*sigsize : sigsize))
+          printf("PARSE ERROR! Large variable index.\n"), exit(3);
+        
+        if (large && reversed)
+          var = (var < sigsize) ? var + sigsize : var - sigsize;
+        
         lits.push( (parsed_lit > 0) ? mkLit(var) : ~mkLit(var) );
     }
 }
 
-template<class B, class Solver>
-static void parse_DIMACS_main(B& in, Solver& S) {
-    vec<Lit> lits;
-    int vars    = 0;
-    int clauses = 0;
-    int cnt     = 0;
-    for (;;){
-        skipWhitespace(in);
-        if (*in == EOF) break;
-        else if (*in == 'p'){
-            if (eagerMatch(in, "p cnf")){
-                vars    = parseInt(in);
-                clauses = parseInt(in);
-                // SATRACE'06 hack
-                // if (clauses > 4000000)
-                //     S.eliminate(true);
-            }else{
-                printf("PARSE ERROR! Unexpected char: %c\n", *in), exit(3);
-            }
-        } else if (*in == 'c' || *in == 'p')
-            skipLine(in);
-        else{
-            cnt++;
-            readClause(in, S, lits);
-            S.addClause_(lits); }
+static void parse_DIMACS_main(StreamBuffer& in, bool reversed, int &signature_size, Clauses &initial, Clauses &universal, Clauses &goal, Clauses &step) {
+  vec<Lit> lits;
+    
+  signature_size = 0;
+  Clauses* target = 0;
+  int cl_to_go = 0;
+    
+  for (;;) {
+    skipWhitespace(in);
+    if (*in == EOF) break;
+              
+    if (*in == 'i') {
+      if (eagerMatch(in, "i cnf")) {
+        if (cl_to_go != 0)
+          printf("PARSE ERROR! Wrong number of clauses promised.\n(reading i and cl_to_go=%d)\n",cl_to_go), exit(3);
+      
+        if (!target) { // first read
+          signature_size = parseInt(in);          
+        } else { // confirmation
+          if (signature_size != parseInt(in))
+            printf("PARSE ERROR! Inconsitent signature size.\n"), exit(3);          
+        }
+        cl_to_go = parseInt(in);
+
+        target = reversed ? &goal : &initial;
+      } else {
+        printf("PARSE ERROR! Unexpected char: %c\n", *in), exit(3);
+      }
+    } else if (*in == 'u') {
+      if (eagerMatch(in, "u cnf")) {
+        if (cl_to_go != 0)
+          printf("PARSE ERROR! Wrong number of clauses promised.\n(reading u and cl_to_go=%d)\n",cl_to_go), exit(3);
+      
+        if (!target) { // first read
+          signature_size = parseInt(in);          
+        } else { // confirmation
+          if (signature_size != parseInt(in))
+            printf("PARSE ERROR! Inconsitent signature size.\n"), exit(3);          
+        }
+        cl_to_go = parseInt(in);
+
+        target = &universal;
+      } else {
+        printf("PARSE ERROR! Unexpected char: %c\n", *in), exit(3);
+      }
+    } else if (*in == 'g') {
+      if (eagerMatch(in, "g cnf")) {
+        if (cl_to_go != 0)
+          printf("PARSE ERROR! Wrong number of clauses promised.\n(reading g and cl_to_go=%d)\n",cl_to_go), exit(3);
+      
+        if (!target) { // first read
+          signature_size = parseInt(in);          
+        } else { // confirmation
+          if (signature_size != parseInt(in))
+            printf("PARSE ERROR! Inconsitent signature size.\n"), exit(3);          
+        }
+        cl_to_go = parseInt(in);
+
+        target = reversed ? &initial : &goal;
+      } else {
+        printf("PARSE ERROR! Unexpected char: %c\n", *in), exit(3);
+      }
+    } else if (*in == 't') {
+      if (eagerMatch(in, "t cnf")) {
+        if (cl_to_go != 0)
+          printf("PARSE ERROR! Wrong number of clauses promised.\n(reading t and cl_to_go=%d)\n",cl_to_go), exit(3);
+      
+        if (!target) { // first read                 
+          signature_size = parseInt(in);
+          if (signature_size & 1)
+            printf("PARSE ERROR! Transition signature of odd size.\n"), exit(3);
+            
+          signature_size >>= 1;
+        } else { // confirmation
+          if (2*signature_size != parseInt(in))
+            printf("PARSE ERROR! Inconsitent signature size.\n"), exit(3);          
+        }
+        cl_to_go = parseInt(in);
+
+        target = &step;
+      } else {
+        printf("PARSE ERROR! Unexpected char: %c\n", *in), exit(3);
+      }
+    } else if (*in == 'c') {
+      skipLine(in);
+    } else {    
+      readClause(in, signature_size, target == &step, reversed, lits);
+      target->push(lits);
+      cl_to_go--;           
     }
-    if (vars != S.nVars())
-        fprintf(stderr, "WARNING! DIMACS header mismatch: wrong number of variables.\n");
-    if (cnt  != clauses)
-        fprintf(stderr, "WARNING! DIMACS header mismatch: wrong number of clauses.\n");
+  }
+
+  if (cl_to_go != 0)
+    printf("PARSE ERROR! Wrong number of clauses promised.\n(reading EOF and cl_to_go=%d)\n",cl_to_go), exit(3);
 }
 
-// Inserts problem into solver.
-//
-template<class Solver>
-static void parse_DIMACS(gzFile input_stream, Solver& S) {
-    StreamBuffer in(input_stream);
-    parse_DIMACS_main(in, S); }
+static void dimacs_LoadSpec(
+        /* input:*/ 
+        const char* input_name, // can be 0 for parsing stdin
+        bool reversed,
+        /*output:*/ int &signature_size, Clauses &initial, Clauses &universal, Clauses &goal, Clauses &step) {
 
+  gzFile input_stream = input_name ? gzopen(input_name, "rb") : gzdopen(0, "rb");   
+  if (input_stream) {
+    StreamBuffer in(input_stream);
+    parse_DIMACS_main(in, reversed, signature_size, initial, universal, goal, step);
+    gzclose(input_stream);
+  } else {
+    printf("Couldn't open file %s!\n",input_name);
+    exit(1);
+  }
+}        
+    
 //=================================================================================================
 }
 
