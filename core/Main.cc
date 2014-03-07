@@ -83,8 +83,8 @@ static BoolOption opt_sttime("STAT", "stime", "Print time statistics.", true);
 
 static IntOption opt_startphase("MAIN", "startphase", "Initial phase to start with (may become incomplete for non-monot designs).", 0, IntRange(0,INT32_MAX));
 
-static BoolOption opt_minimize  ("MAIN", "min", "(Inductively) minimize learned clauses.", true); 
-static BoolOption opt_induction ("MAIN", "ind", "Use induction for minimization.", false); 
+static BoolOption opt_minimize ("MAIN", "min", "(Inductively) minimize learned clauses.", true); 
+static IntOption opt_induction ("MAIN", "ind", "Use induction for minimization (1 = one pass, 2 = iterate until fixpoint).", 0, IntRange(0,2)); 
 
 //=================================================================================================
 
@@ -273,7 +273,6 @@ struct SolvingContext {
   int minim_attempts;  
   int minim_solver;
   int minim_explicit;
-  int minim_inductively;
   int minim_push;
     
   int model_min_layer;
@@ -284,7 +283,7 @@ struct SolvingContext {
                      oblig_processed(0), oblig_subsumed(0), oblig_sat(0), oblig_unsat(0), oblig_resched_clause(0), oblig_resched_subs(0),                                                                                                        
                      clauses_dersolver(0), clauses_univ(0), clauses_strengthened(0),                                         
                      solver_call_extension(0), solver_call_push(0),                     
-                     minim_attempts(0), minim_solver(0), minim_explicit(0), minim_inductively(0), minim_push(0),
+                     minim_attempts(0), minim_solver(0), minim_explicit(0), minim_push(0),
                      model_min_layer(0), model_max_depth(0),                       
                      called(0),
                      initial_obligation(0,0)
@@ -375,13 +374,12 @@ struct SolvingContext {
     if (opt_minimize && opt_sminim) {
       printf("\nMinimization averages from %d attempts:\n", minim_attempts);
       printf("\t%f by solver,\n",(1.0*minim_solver)/minim_attempts);      
-      printf("\t%f by picking (%f from inducive passes),\n",(1.0*minim_explicit)/minim_attempts,(1.0*minim_inductively)/minim_attempts);
+      printf("\t%f by picking,\n",(1.0*minim_explicit)/minim_attempts);
       printf("\t%f by pushing.\n",(1.0*minim_push)/minim_attempts);
             
       minim_attempts = 0;
       minim_solver = 0;      
       minim_explicit = 0;
-      minim_inductively = 0;
       minim_push = 0;    
     }
     
@@ -478,7 +476,8 @@ struct SolvingContext {
   }
   */
       
-  static const int inductive_layer_idx; 
+  static const int inductive_layer_idx;
+  static const int assumption_mark_id;  
   
   vec<int> marks_tmp;
   
@@ -496,23 +495,24 @@ struct SolvingContext {
    
   int called; 
    
-  bool callSolver(int idx, CLOCK_CLOCKS cc,       // calls the idx-th solver, under then give assumptions filtered_ma plus the layer assumptions
+  bool callSolver(int index, CLOCK_CLOCKS cc,       // calls the index-th solver, under then give assumptions filtered_ma plus the layer assumptions
                   bool compute_conflict,          // request for returning (minimized, if flag set) appropriate conflict clause (to be delivered in conflict_out), 
                                                   // also, target_layer_out will containt index of the least delta layer on which the conflict depends (or inductive_layer_idx for "infty")
                   bool induction) {               // allow using induction during minimization
                                                            
 
-    MarkingSolver& solver = *solvers[idx];
+    MarkingSolver& solver = *solvers[index];
 
-    //printf("Calling for solver %d with ma ",idx); printLits(filtered_ma);
+    //printf("Calling for solver %d with ma ",index); printLits(filtered_ma);
                  
     clock_StopAddPassedTime(clock_MAIN);
     clock_StartCounter(cc);   
     
     minimark_in.clear();
-    for (int i = idx; i <= phase; i++)
+    for (int i = index; i <= phase; i++)
       minimark_in.push(i);
-    minimark_in.push(inductive_layer_idx); 
+    minimark_in.push(inductive_layer_idx);
+    minimark_in.push(assumption_mark_id);
     
     solver.preprocessAssumptions(filtered_ma,minimark_in);    
     bool result = (solver.simplify(),solver.solve());
@@ -529,7 +529,9 @@ struct SolvingContext {
         for (int i = 0; i < conflict_out.size(); i++)
           conflict_out[i] = ~conflict_out[i];                                      
         solver.preprocessAssumptions(conflict_out,minimark_in);
-        Lit indy = solver.getAssump(conflict_out.size() + minimark_in.size() - 1); // the translation of the induction marker, which we never plan to remove
+        Lit indy = solver.getAssump(conflict_out.size() + minimark_in.size() - 2); // the translation of the induction marker, which we never plan to remove
+        int assy_idx = conflict_out.size() + minimark_in.size() - 1;
+        Lit assy = solver.getAssump(assy_idx); // the translation of the assumption marker, which we never plan to remove
         int size = conflict_out.size();
                       
         //generate random permutation
@@ -548,21 +550,6 @@ struct SolvingContext {
         do {                 
           removed_something = false;
           
-          if (induction && opt_induction) { // inductively assume the current conflict clause            
-            //abusing conflict_out for that
-            conflict_out.clear();
-            for (int i = 0; i < size; i++) {
-              Lit l = solver.getAssump(i);
-              if (l != indy && var(l) < sigsize)
-                conflict_out.push(mkLit(var(l)+sigsize,!sign(l)));   // negate back and shift
-            }
-            conflict_out.push(goal_lit);                       
-            
-            marks_tmp.clear();
-            marks_tmp.push(inductive_layer_idx); 
-            solver.addClause(conflict_out,marks_tmp);
-          }
-          
           // one pass:
           for (int i = 0; i < size; i++) {
             int idx = rnd_perm[i];
@@ -570,27 +557,47 @@ struct SolvingContext {
             if (save == indy) // already removed in previous passes
               continue;
 
-            solver.setAssump(idx,indy);
+            solver.setAssump(idx,indy);  // one assumption effectively removed (since replaced by indy)
+            
+            if (induction && opt_induction) {  // inductively assume the current conflict clause            
+              //abusing conflict_out for that
+              conflict_out.clear();
+              for (int i = 0; i < size; i++) {
+                Lit l = solver.getAssump(i);
+                if (l != indy && var(l) < sigsize)
+                  conflict_out.push(mkLit(var(l)+sigsize,!sign(l)));   // negate back and shift
+              }
+              conflict_out.push(goal_lit);                       
+              
+              marks_tmp.clear();
+              marks_tmp.push(assumption_mark_id); 
+              solver.addClause(conflict_out,marks_tmp);
+            }
           
-            if (solver.simplify(),solver.solve())
-              solver.setAssump(idx,save);                          
-            else {              
+            if (solver.simplify(),solver.solve()) {
+              solver.setAssump(idx,save);  // put the literal back
+
+              if (induction && opt_induction) {
+                solver.invalidateMarker(assumption_mark_id); // efectively delete the assumed clause                
+                assy = mkLit(solver.ensureMarkerRegistered(assumption_mark_id),true); // immediately claim it again (the same id, but a new var!) and make a lit out of it
+                solver.setAssump(assy_idx,assy);  // assume the new guy from now on
+              }
+              
+            } else {              
               minim_explicit++;
               removed_something = true;
-              if (cycle_count) 
-                minim_inductively++;
             }
           }
           cycle_count++;
-        } while (induction && opt_induction && removed_something);       
+        } while (induction && (opt_induction>1) && removed_something);       
         
         // "pushing"         
-        target_layer_out = idx;        
-        for (int i = 0; i < minimark_in.size()-1; i++) {
+        target_layer_out = index;        
+        for (int i = 0; i < minimark_in.size()-2; i++) {
           solver.setAssump(size + i, indy);
           if (solver.simplify(),solver.solve())
             break;
-          target_layer_out = minimark_in[i+1]; //makes sense even with inductive_layer_idx, which is the last value       
+          target_layer_out = minimark_in[i+1]; //makes sense even with inductive_layer_idx, which is the last but one value       
           minim_push++;
         }       
                      
@@ -604,12 +611,12 @@ struct SolvingContext {
         
         // cleanup
         if (induction && opt_induction)
-          solver.invalidateMarker(inductive_layer_idx);
+          solver.invalidateMarker(assumption_mark_id);
           
       } else {
         target_layer_out = inductive_layer_idx;                           
         for (int i = 0; i < minimark_out.size(); i++)
-          if (minimark_out[i] < target_layer_out)
+          if (minimark_out[i] < target_layer_out) // relying on (inductive_layer_idx < assumption_mark_id)
             target_layer_out = minimark_out[i];      
       }
     }
@@ -1168,7 +1175,8 @@ struct SolvingContext {
   }
 };
 
-const int SolvingContext::inductive_layer_idx = INT_MAX;  
+const int SolvingContext::inductive_layer_idx = INT_MAX-1;  
+const int SolvingContext::assumption_mark_id  = INT_MAX;
 
 //=================================================================================================
 

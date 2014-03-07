@@ -47,11 +47,12 @@ class MarkingSolver : public Solver {
                                       // the solver may later decide to really delete such clauses, and to recycle the respective variable for a newly requested marker)
                                       // (can be called even on previously unregistered marker, in which case this is no-op)
     void invalidateAll();
-    
+   
+    Var ensureMarkerRegistered(int id);   
   protected:    
     int base_marker_index;
   
-    void ensureMarkerRegistered(int id);    
+    
     std::map<int,Var> id2var;  // map ids->vars, stores the variable currently assigned to a marker with the given id    
     std::map<Var,int> var2id;  // for storing the inverse map
 };

@@ -34,13 +34,15 @@ void MarkingSolver::initilazeSignature(int number_of_basic_vars) {
   base_marker_index = nVars();
 }
 
-void MarkingSolver::ensureMarkerRegistered(int id) {
-  if (id2var.find(id) != id2var.end()) //already registered
-    return;
+Var MarkingSolver::ensureMarkerRegistered(int id) {
+  std::map<int,Var>::const_iterator it = id2var.find(id);
+  if (it != id2var.end()) //already registered
+    return it->second;
 
   Var v = newVar();
   id2var[id] = v;
   var2id[v] = id;
+  return v;
 }
 
 void MarkingSolver::invalidateMarker(int id) {
