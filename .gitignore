@@ -1,8 +1,7 @@
 *.o
+!aiger.o
 *.od
 *.or
-*.aig
-*.spec
 callgrind.out.*
 .kdbgrc.*
 minireachIC3

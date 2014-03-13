@@ -1,4 +1,10 @@
 /************************************************************************************[SimpSolver.h]
+Copyright (c) 2013, Martin Suda
+Max-Planck-Institut für Informatik, Saarbrücken, Germany
+ 
+minireachIC3 sources are based on MiniSat (see below MiniSat copyrights). Permissions and copyrights of
+minireachIC3 are exactly the same as Minisat on which it is based on. (see below).
+
 Copyright (c) 2006,      Niklas Een, Niklas Sorensson
 Copyright (c) 2007-2010, Niklas Sorensson
 

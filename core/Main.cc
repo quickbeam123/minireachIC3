@@ -1,4 +1,10 @@
 /*****************************************************************************************[Main.cc]
+Copyright (c) 2013, Martin Suda
+Max-Planck-Institut für Informatik, Saarbrücken, Germany
+ 
+minireachIC3 sources are based on MiniSat (see below MiniSat copyrights). Permissions and copyrights of
+minireachIC3 are exactly the same as Minisat on which it is based on. (see below).
+
 Copyright (c) 2003-2006, Niklas Een, Niklas Sorensson
 Copyright (c) 2007-2010, Niklas Sorensson
 
@@ -56,7 +62,7 @@ static IntOption  opt_kth_property("PARSE", "id","Pick a particular property fro
                                                  "-1 picks the only one and aborts if there is no such.\n"
                                                  "-2 just prints the ids of all available and aborts", -1, IntRange(-2, INT32_MAX));
 
-static BoolOption opt_reversed    ("PARSE", "rev", "Swap initial and goal formulas after parsing.", false);
+static BoolOption opt_reversed    ("PARSE", "rev", "Swap initial and goal formulas after parsing.", true);
 static BoolOption opt_elimination ("MAIN", "simp", "Perform variable elimination before actual solving.", true);
 
 static IntOption opt_phaselim ("MAIN", "phaselim", "Terminate after a given number of phases.", 0, IntRange(0,INT32_MAX));

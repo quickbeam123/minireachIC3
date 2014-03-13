@@ -1,4 +1,10 @@
 /*******************************************************************************************[Vec.h]
+Copyright (c) 2012, Martin Suda
+Max-Planck-Institut für Informatik, Saarbrücken, Germany
+ 
+LS4 sources are based on MiniSat (see below MiniSat copyrights). Permissions and copyrights of
+LS4 are exactly the same as Minisat on which it is based on. (see below).
+
 Copyright (c) 2003-2007, Niklas Een, Niklas Sorensson
 Copyright (c) 2007-2010, Niklas Sorensson
 

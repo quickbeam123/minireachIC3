@@ -1,0 +1,28 @@
+--- To compile:
+
+cd core
+make         # for an optimized version, but with asserts and debug info
+make r       # for a release version (optimized, no asserts, no debug info)
+make d       # for a debug version (unoptimized, asserts, debug info)
+
+Note: Although the sources of the used aiger library are provided,
+they are not compiled automatically by the makefile. That's why 
+a compiled module aiger.o is also included. It is a 64bit version of the library.
+
+If you need to compile minireachIC3 for 32bit, either rename the provided file
+aiger.o_32 to aiger.o and then run make, or persuade the makefile to compile aiger.o for you from the sources.
+
+--- To run on hardware model checking problems in the aiger format:
+
+./minireachIC3 bobsmminiuart.aig
+
+--- To run on symbolic transition systems in the DIMSPEC (http://www.mpi-inf.mpg.de/~suda/DIMSPEC.html) format:
+
+./minireachIC3 -format=dimspec freecell.spec
+
+--- To view the available options:
+
+./minireachIC3 --help
+
+The relevant options are INPUT, PARSE, MAIN and STAT options.
+The other categories are inherited from Minisat and their effect on minireachIC3 has not been tested.
