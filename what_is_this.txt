@@ -1,1 +1,3 @@
 Extending minireachReuse with IC3 clause maintanance scheme: Layers are monotonte, delta encoded, and after each phase clauses are pushed forward.
+
+Eventually turned out to be the best engine we have - so this a big bow to Bradley and the only question that remains is how to sell any of the ideas we had while working on hw examples if they are practically dominated by IC3?

@@ -42,6 +42,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include <map>
 #include <algorithm>
 #include <queue>
+#include <deque>
 
 using namespace Minisat;
 
@@ -60,7 +61,8 @@ static BoolOption opt_elimination ("MAIN", "simp", "Perform variable elimination
 
 static IntOption opt_phaselim ("MAIN", "phaselim", "Terminate after a given number of phases.", 0, IntRange(0,INT32_MAX));
 
-// TODO: should try handling obligations queue-wise (currently is stack-wise) - longer model paths have preference ...
+static BoolOption opt_obligqueue("MAIN", "oblqueue", "Store obligations FIFO-style. (as opposed to LIFO).", false); 
+
 static BoolOption opt_earlystop ("MAIN", "earlystop", "Don't put weak clauses into strong layers.", true); // seems to be a good idea after all
 
 static IntOption opt_resched ("MAIN", "resched", "Reschedule obligations (allows long models).", 1, IntRange(0,3));
@@ -129,7 +131,7 @@ struct Obligation {
   Obligation *next; // used for parent pointers for active obligations (which is later used for reconstructing the witness)
   
   vec<Lit> ma;
-  ABSTRACTION_TYPE abs; // abstraction of the above   
+  ABSTRACTION_TYPE abs; // abstraction of the above
   
   Obligation(int d, Obligation* n) : depth(d), next(n) {}
 };
@@ -217,6 +219,8 @@ struct CBoxVec {
   }  
 };
 
+typedef std::deque<Obligation*> OblDeque;
+
 struct SolvingContext {  
   Lit goal_lit;
   bool artificial_goal_var;
@@ -239,7 +243,7 @@ struct SolvingContext {
   CBoxVec push_requests;  // and here
   CBoxVec witnesses;      //  or here their respective bros
    
-  vec< vec<Obligation*> > obligations;
+  vec< OblDeque > obligations;
         
   // statistics
   int pushing_request;
@@ -294,8 +298,8 @@ struct SolvingContext {
       printGOStat();      
 
     for (int i = 0; i < obligations.size(); i++)
-      for (int j = 0; j < obligations[i].size(); j++)
-        delete obligations[i][j];
+      for (OblDeque::iterator it = obligations[i].begin(); it != obligations[i].end(); ++it)
+        delete (*it);
       
     for (int i = 0; i < layers.size(); i++)
       while (layers[i])
@@ -672,6 +676,9 @@ struct SolvingContext {
     return (a1 & ~a2) == 0;
   }
   
+  /*
+     A new clause should enter a layer. Subsume all the guys that are there (the new could could get subsumed as well).
+  */
   int pruneLayerByClause(ABSTRACTION_TYPE abs, vec<Lit>const & clause, int idx, bool testForWeak = true) {
     // frees subsumed clauses in layer
     int res = 0; //returns the number of subsumed guys and -1 if the argument was subsumed (and testForWeak was true)       
@@ -695,6 +702,10 @@ struct SolvingContext {
     return res;
   }
      
+  /* 
+    A new strong clause is coming to this layer, maybe some obligations will be pushed back.
+    (not killed, actually, they all wait for the phase to be over, since they could be somebody's parents)
+  */
   int pruneObligations(ABSTRACTION_TYPE abs,
                        vec<Lit>const & clause,   //the potentially subsuming clause
                        int from,                 //the position to work on (if out of bounds, just no-op)
@@ -706,11 +717,11 @@ struct SolvingContext {
       relocate_to = phase+1;
       
     int res = 0;
-    vec<Obligation*> & obligs = obligations[from];
+    OblDeque& obligs = obligations[from];
     
-    int i,j;
-    for (i=0, j=0; i < obligs.size(); i++) {
-      vec<Lit> &ma = obligs[i]->ma;
+    OblDeque::iterator it,jt;
+    for (it = jt = obligs.begin(); it != obligs.end(); ++it) {
+      vec<Lit> &ma = (*it)->ma;
             
       assert(clause_sorted(ma));
     
@@ -718,22 +729,25 @@ struct SolvingContext {
       // this subsumption check only ever works because goal_lit is part of the bridge
       // (and all the generated ma's don't satisfy the goal -- otherwise we would terminate with SAT)
       
-      if (absSubsumes(abs,obligs[i]->abs) && subsumes(clause,ma)) {
+      if (absSubsumes(abs,(*it)->abs) && subsumes(clause,ma)) {
         res++;
         
         if (opt_resched) { 
-          obligations[relocate_to].push(obligs[i]);          
+          obligations[relocate_to].push_back(*it);          
           oblig_resched_subs++;                                         
         } else
-          delete obligs[i];
+          delete (*it);
       } else  // keeping it here
-        obligs[j++] = obligs[i];                    
+        *jt++ = *it;
     }
-    obligs.shrink(i-j);
+    obligs.erase(jt,obligs.end());
   
     return res;
   }
   
+  /* 
+    A new strong clause is coming to this layer, so it could initiate some pushing by killing a witness.
+  */
   int pruneWitnesses(ABSTRACTION_TYPE abs,
                      vec<Lit>const & clause,   //the potentially subsuming clause
                      int from) {  
@@ -759,6 +773,9 @@ struct SolvingContext {
     return res;
   }
   
+  /*
+    a new clause (either just derived or pushed) is coming to this clause
+  */
   void handleNewClause(int target_layer, int first_questionable, int upmost_layer, ABSTRACTION_TYPE abs, vec<Lit> const & clause, vec<int> const& markers) {  
     int stopped = 0;    
     int sum_cl_killed = 0;
@@ -775,7 +792,7 @@ struct SolvingContext {
           stopped = i;
           // printf("Killed in %d. ",i);                   
           
-          if (opt_earlystop)
+          if (opt_earlystop) // true by default!
             return;          
         } else {
           clauses_strengthened += res;
@@ -799,6 +816,9 @@ struct SolvingContext {
     //printf("Killed %d, went %d steps deep and subsumed %d obligations\n",sum_cl_killed,target_layer-stopped,sum_ob_pushed);    
   }
       
+  /* 
+    new clause, push clause, or a clause with a killed witness is looking for new one
+  */
   void lookForWitness(CWBox * cl_box, int index) {
     vec<Lit> & clause = cl_box->data;
    
@@ -876,8 +896,13 @@ struct SolvingContext {
       if (obl_top > phase) {
         ob = &initial_obligation;        
       } else {
-        ob = obligations[obl_top].last();        
-        obligations[obl_top].pop();
+        if (opt_obligqueue) {
+          ob = obligations[obl_top].front();        
+          obligations[obl_top].pop_front();
+        } else {
+          ob = obligations[obl_top].back();        
+          obligations[obl_top].pop_back();
+        }
       }
 
       int model_idx = obl_top-1;
@@ -940,8 +965,8 @@ struct SolvingContext {
         new_ob->abs = calcAbstraction(ma);
 
         if (ob->depth > 0)   // the initial guy is never stored
-          obligations[obl_top].push(ob);
-        obligations[new_top].push(new_ob);
+          obligations[obl_top].push_back(ob);
+        obligations[new_top].push_back(new_ob);
         
         obl_top = new_top; // follow him forward       
                 
@@ -991,8 +1016,8 @@ struct SolvingContext {
           }
 
           //delete obligations pushed to death
-          for (int i = 0; i < obligations[phase+1].size(); i++)
-            delete obligations[phase+1][i];
+          for (OblDeque::iterator it = obligations[phase+1].begin(); it != obligations[phase+1].end(); ++it)
+            delete (*it);
           obligations[phase+1].clear();
           
           return false;
@@ -1004,7 +1029,7 @@ struct SolvingContext {
           // CAREFUL we do rescheduling even before handling the clause, so that in case of generalization even this pushed ob will get killed
           if (opt_resched) {
             assert(obl_top <= phase);
-            obligations[obl_top+1].push(ob);           
+            obligations[obl_top+1].push_back(ob);           
             oblig_resched_clause++;
           } else 
             delete ob;                   
@@ -1023,7 +1048,7 @@ struct SolvingContext {
           }
           conflict_out.shrink(i-j);          
           conflict_out.push(goal_lit);  // doing it the monotone way!          
-          sort(conflict_out);  // ClauseSet assumes the input is sorted                          
+          sort(conflict_out);  // sort for fast subsumption checks                         
           
           ABSTRACTION_TYPE abs = calcAbstraction(conflict_out);
           
