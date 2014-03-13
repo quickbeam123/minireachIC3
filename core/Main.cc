@@ -154,13 +154,11 @@ struct CWBox {
   vec<Lit> data;         // for clause the actual literals, for witness the negated state as a clause
   ABSTRACTION_TYPE abs;  // abstraction of the above
   
-  CWBox*  other;  // the other of the two
-  
   CWBox*  next;    // to form a linked list  
   CWBox** prev;    // to delete from anywhere
   
-  CWBox() : abs(0), other(0), next(0), prev(0) { id = ids ++; }
-  CWBox(ABSTRACTION_TYPE a, vec<Lit> const & d) : abs(a), other(0), next(0), prev(0) { d.copyTo(data); id = ids ++; } 
+  CWBox() : abs(0), next(0), prev(0) { id = ids ++; }
+  CWBox(ABSTRACTION_TYPE a, vec<Lit> const & d) : abs(a), next(0), prev(0) { d.copyTo(data); id = ids ++; } 
     
   void integrate(CWBox** holder) {  // like insert
     assert(holder);
@@ -248,9 +246,7 @@ struct SolvingContext {
   
   vec<MarkingSolver*> solvers;
   
-  CBoxVec layers;         // here sit the clauses   
-  CBoxVec push_requests;  // and here
-  CBoxVec witnesses;      //  or here their respective bros
+  CBoxVec layers;         // here sit the clauses
    
   vec< OblDeque > obligations;
         
@@ -293,10 +289,6 @@ struct SolvingContext {
   { }    
 
   void deleteClause(CWBox *cl_box) {
-    if (cl_box->other) {
-      cl_box->other->disintegrate();
-      delete cl_box->other;
-    }
     cl_box->disintegrate();
     delete cl_box;
   }
@@ -761,34 +753,6 @@ struct SolvingContext {
     return res;
   }
   
-  /* 
-    A new strong clause is coming to this layer, so it could initiate some pushing by killing a witness.
-  */
-  int pruneWitnesses(ABSTRACTION_TYPE abs,
-                     vec<Lit>const & clause,   //the potentially subsuming clause
-                     int from) {  
-    if (from > phase)
-      return 0;
-    
-    int res = 0;
-    
-    for(CWBox* wit_box = witnesses[from]; wit_box != 0; /*iteration inside*/) {
-      if (absSubsumes(abs,wit_box->abs) && subsumes(clause,wit_box->data)) { // clause will need a new witness
-        CWBox* tmp_box = wit_box;
-        wit_box = wit_box->next;
-        
-        res++;
-        
-        tmp_box->disintegrate();
-        tmp_box->integrate(&push_requests[from]);
-      } else {
-        wit_box = wit_box->next;
-      }    
-    }
-    
-    return res;
-  }
-  
   /*
     a new clause (either just derived or pushed) is coming to this clause
   */
@@ -817,9 +781,7 @@ struct SolvingContext {
           
           int obl_res = pruneObligations(abs,clause,i,target_layer+1); // the new clause is still strong, could it kill/push some obligations here?
           sum_ob_pushed += obl_res;
-          oblig_subsumed += obl_res;
-          
-          int wit_res = pruneWitnesses(abs,clause,i);
+          oblig_subsumed += obl_res;      
         }
       }
                  
@@ -831,54 +793,6 @@ struct SolvingContext {
     
     //printf("Killed %d, went %d steps deep and subsumed %d obligations\n",sum_cl_killed,target_layer-stopped,sum_ob_pushed);    
   }
-      
-  /* 
-    new clause, push clause, or a clause with a killed witness is looking for new one
-  */
-  void lookForWitness(CWBox * cl_box, int index) {
-    vec<Lit> & clause = cl_box->data;
-   
-    solver_call_push++;    
-    pushing_request++;
-    if (cl_box->other->data.size())
-      pushing_nontriv_request++;
-      
-    filtered_ma.clear();
-    for (int l = 0; l < clause.size(); l++) {
-      assert(var(clause[l]) >= sigsize);
-      filtered_ma.push(mkLit(var(clause[l])-sigsize,!sign(clause[l])));      
-    }
-    filtered_ma.push(mkLit(2*sigsize, false));                   
-    
-    if (callSolver(index,clock_SOLVER_PUSH,false,false)) {
-      MarkingSolver &model_solver = *solvers[index];      
-      
-      // extract the witness
-      vec<Lit> & ma = cl_box->other->data;
-      ma.clear();      
-      //like when extracting ma normally
-      for (int j = 0; j < sigsize; j++) {
-        assert(model_solver.model[j+sigsize] != l_Undef);  
-        if (bridge_variables[j])                                              
-          ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and unnegated
-      }
-      // and we don't add the initial marker
-      cl_box->other->abs = calcAbstraction(ma);      
-      
-      cl_box->other->integrate(&witnesses[index]);
-    } else {     // pushed
-      marks_tmp.clear();
-      marks_tmp.push(index+1);
-    
-      pushing_success++;
-    
-      handleNewClause(index+1,index+1,index+1,cl_box->abs,clause,marks_tmp); /* it should not get subsumed there! */
-    
-      cl_box->disintegrate();
-      cl_box->integrate(&layers[index+1]);
-      cl_box->other->integrate(&push_requests[index+1]);                                        
-    }
-  }
   
   Obligation initial_obligation;
   
@@ -889,17 +803,11 @@ struct SolvingContext {
       // first do all the necessary pushing 
       // (TODO: maybe stop before the current value of obl_top?)
       // (TODO: maybe keep note of where from it makes sense to start looking for push_requests?)      
-      for (int i = 1; i < phase /*cannot push from L_{phase}, there is not L_{phase+1} yet*/; i++) {
-        while (push_requests[i]) {
-          CWBox* req_box = push_requests[i];
-          req_box->disintegrate();
-          lookForWitness(req_box->other,i);
-        }
-        
+      for (int i = 0; i < phase /*cannot push from L_{phase}, there is not L_{phase+1} yet*/; i++) {        
         if (layers[i] == 0) {
           printf("// UNSAT: repetition detected!\n");
           if (opt_verbose)
-            printf("// Delta-layer %d emptied by pushing!\n",i);            
+            printf("// Delta-layer %d emptied by subsumption!\n",i);            
           return true;
         }
       }
@@ -1087,13 +995,7 @@ struct SolvingContext {
             handleNewClause(target_layer_out+1,model_idx,0,abs,conflict_out,marks_tmp);
             
             CWBox *clbox = new CWBox(abs,conflict_out);
-            clbox->integrate(&layers[target_layer_out+1]);
-  
-            CWBox *prbox = new CWBox();
-            prbox->integrate(&push_requests[target_layer_out+1]);
-            
-            clbox->other = prbox;
-            prbox->other = clbox;            
+            clbox->integrate(&layers[target_layer_out+1]);    
           }                   
 
           // Experiment temporary - very stupid repetition test:
@@ -1126,8 +1028,6 @@ struct SolvingContext {
       assert(layers[phase] == 0);      
 
       obligations.push();      // the zero-th will be always empty: obligation at index i, has its ma inside L_i
-      push_requests.push();
-      witnesses.push();
       
       solvers.push(new MarkingSolver());      
       MarkingSolver &solver = *solvers.last();            
@@ -1145,9 +1045,16 @@ struct SolvingContext {
       if (phase == 0) {
         marker.push(0); // but 0-th layer will remain empty
         
-        // in fact, this is just the single literal single clause
-        for (int i = 0; i < goal_clauses.size(); i++)
-          solver.addClause(goal_clauses[i],marker);
+        // the single literal single clause + all the boost clauses (if applicable)
+        for (int i = 0; i < goal_clauses.size(); i++) {
+          vec<Lit> & goal_clause = goal_clauses[i];               
+          sort(goal_clause);
+                
+          CWBox *clbox = new CWBox(calcAbstraction(goal_clause),goal_clause);
+          clbox->integrate(&layers[0]);
+          
+          solver.addClause(goal_clause,marker);         
+        }
       }
       
       if (!solver.simplify()) {
