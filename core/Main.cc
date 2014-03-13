@@ -84,7 +84,7 @@ static BoolOption opt_sttime("STAT", "stime", "Print time statistics.", true);
 static IntOption opt_startphase("MAIN", "startphase", "Initial phase to start with (may become incomplete for non-monot designs).", 0, IntRange(0,INT32_MAX));
 
 static BoolOption opt_minimize ("MAIN", "min", "(Inductively) minimize learned clauses.", true); 
-static IntOption opt_induction ("MAIN", "ind", "Use induction for minimization (1 = one pass, 2 = iterate until fixpoint).", 0, IntRange(0,2)); 
+static IntOption opt_induction ("MAIN", "ind", "Use induction for minimization (1 = one pass, 2 = iterate until fixpoint).", 2, IntRange(0,2)); 
 
 //=================================================================================================
 
