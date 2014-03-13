@@ -240,6 +240,7 @@ struct SolvingContext {
   // Well, in general this is a little more complicated: remember there is S_in, S_out, and S_reg in the  Niklases' paper -- the low signature should contain S_in and S_reg
 
   int phase;
+  int least_affected_layer;  
   
   vec<MarkingSolver*> solvers;
   
@@ -249,7 +250,6 @@ struct SolvingContext {
         
   // statistics
   int pushing_request;
-  int pushing_nontriv_request;
   int pushing_success;
   
   int oblig_processed;
@@ -275,7 +275,8 @@ struct SolvingContext {
   int model_max_depth;   
      
   SolvingContext() : phase(-1),
-                     pushing_request(0), pushing_nontriv_request(0), pushing_success(0),
+                     least_affected_layer(0),
+                     pushing_request(0), pushing_success(0),
                      oblig_processed(0), oblig_subsumed(0), oblig_sat(0), oblig_unsat(0), oblig_resched_clause(0), oblig_resched_subs(0),                                                                                                        
                      clauses_dersolver(0), clauses_univ(0), clauses_strengthened(0),                                         
                      solver_call_extension(0), solver_call_push(0),                     
@@ -309,11 +310,10 @@ struct SolvingContext {
   void printStat(bool between_phases = false) {
     if (opt_statpushing) {
       printf("\nClause pushing:\n");                     
-      printf("\t%d requests handled.\n",pushing_request);
-      printf("\t%d proper - %d clauses pushed.\n", pushing_nontriv_request,pushing_success);                     
+      printf("\t%d pushes attempted.\n",pushing_request);
+      printf("\t%d clauses pushed.\n", pushing_success);                     
     
-      pushing_request = 0;     
-      pushing_nontriv_request = 0;
+      pushing_request = 0;           
       pushing_success = 0;      
     }
        
@@ -760,7 +760,7 @@ struct SolvingContext {
     //printf("Inserting %s-clause to layer %d to kill ma in layer %d. ",target_layer <= phase ? "N" : "U",target_layer,first_questionable+1);
            
     for (int i = target_layer; i >= upmost_layer; i--) {
-      if (!stopped) {    
+      if (!stopped) {             
         int res = pruneLayerByClause(abs,clause,i,/* maybe_weak (?)*/ i <= first_questionable /* otherwise don't test forward */ );
                                     
         if (res < 0) { //got subsumed here; will not subsume anymore
@@ -779,6 +779,9 @@ struct SolvingContext {
           int obl_res = pruneObligations(abs,clause,i,target_layer+1); // the new clause is still strong, could it kill/push some obligations here?
           sum_ob_pushed += obl_res;
           oblig_subsumed += obl_res;      
+          
+          if (least_affected_layer > i)
+            least_affected_layer = i;          
         }
       }
                  
@@ -804,7 +807,7 @@ struct SolvingContext {
         if (layers[i] == 0) {
           printf("// UNSAT: repetition detected!\n");
           if (opt_verbose)
-            printf("// Delta-layer %d emptied by subsumption!\n",i);            
+            printf("// Delta-layer %d emptied by pushing!\n",i);            
           return true;
         }
       }
@@ -1017,6 +1020,8 @@ struct SolvingContext {
     
     clock_StartCounter(clock_MAIN);
     
+    least_affected_layer = 1;
+    
     for (phase = 0; ; phase++) {
       layers.push();                             // place for the new layer                  
       if (layers[phase])                          // inductive layer non-empty ?
@@ -1052,6 +1057,53 @@ struct SolvingContext {
           
           solver.addClause(goal_clause,marker);         
         }
+      } else { 
+        // here we do the pushing
+        for (int i = least_affected_layer; i < phase; i++) {        
+          for (CWBox* cl_box = layers[i]; cl_box != 0; /*increment inside*/) {          
+            vec<Lit> & clause = cl_box->data;     
+            solver_call_push++;            
+              
+            filtered_ma.clear();
+            for (int l = 0; l < clause.size(); l++) {
+              assert(var(clause[l]) >= sigsize);
+              filtered_ma.push(mkLit(var(clause[l])-sigsize,!sign(clause[l])));      
+            }
+            filtered_ma.push(mkLit(2*sigsize, false));                   
+            
+            pushing_request++;
+            
+            if (callSolver(i,clock_SOLVER_PUSH,false,false)) {
+              // SAT -> no pushing
+              cl_box = cl_box->next;
+              
+            } else {     
+              // UNSAT -> push
+              marks_tmp.clear();
+              marks_tmp.push(i+1);
+            
+              pushing_success++;
+            
+              handleNewClause(i+1,i+1,i+1,cl_box->abs,clause,marks_tmp); /* it should not get subsumed there! */
+                       
+              CWBox* tmp_box = cl_box;
+              cl_box = cl_box->next;
+                     
+              tmp_box->disintegrate();
+              tmp_box->integrate(&layers[i+1]);                                      
+            }          
+          }
+      
+          // test empty               
+          if (layers[i] == 0) {
+            printf("// UNSAT: repetition detected!\n");
+            if (opt_verbose)
+              printf("// Delta-layer %d emptied by pushing!\n",i);            
+            return;
+          }
+        }
+        
+        least_affected_layer = phase;
       }
       
       if (!solver.simplify()) {
