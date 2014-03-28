@@ -1246,7 +1246,7 @@ static void verifyStep(int sigsize, Clauses &initial, Clauses &goal, Clauses &un
             goto next_step_clause;
         } else {
           if (!opt_reversed && cur_model[var(step[i][j])-sigsize] != sign(step[i][j]) ||
-               opt_reversed && prev_model[var(step[i][j])] != sign(step[i][j]))
+               opt_reversed && prev_model[var(step[i][j])-sigsize] != sign(step[i][j]))
             goto next_step_clause;        
         }
                       
