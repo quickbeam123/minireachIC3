@@ -86,6 +86,8 @@ static IntOption opt_startphase("MAIN", "startphase", "Initial phase to start wi
 static BoolOption opt_minimize ("MAIN", "min", "(Inductively) minimize learned clauses.", true); 
 static IntOption opt_induction ("MAIN", "ind", "Use induction for minimization (1 = one pass, 2 = iterate until fixpoint).", 2, IntRange(0,2)); 
 
+static BoolOption opt_print_solution ("MAIN", "psol", "Print the solution assignment (for dimspec format inputs).", false);
+
 //=================================================================================================
 
 void printVec(const vec<int>& v) {
@@ -1426,7 +1428,8 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
   Clauses& model_path = context.model_path;
     
   if (model_path.size() > 0                // the SAT CASE
-       && (strcmp(opt_format,"dimspec") == 0)) {   // and somebody is interested             
+       && (strcmp(opt_format,"dimspec") == 0)
+       && opt_print_solution) {   // and somebody is interested             
     
     vec<bool> prev_model;
     vec<bool> cur_model;
