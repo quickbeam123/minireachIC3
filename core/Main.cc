@@ -87,6 +87,7 @@ static BoolOption opt_minimize ("MAIN", "min", "(Inductively) minimize learned c
 static IntOption opt_induction ("MAIN", "ind", "Use induction for minimization (1 = one pass, 2 = iterate until fixpoint).", 2, IntRange(0,2)); 
 
 static BoolOption opt_print_solution ("MAIN", "psol", "Print the solution assignment (for dimspec format inputs).", false);
+static BoolOption opt_move_auxil ("MAIN", "aux", "Move low auxiliary variables to upper signature.", true);
 
 //=================================================================================================
 
@@ -1524,6 +1525,51 @@ bool ensure_single_unit_goal(int &sigsize, Clauses &initial, Clauses &goal, Clau
   return true;
 }
 
+void auxiliary_variables_to_upper(int sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
+  vec<bool> low_auxil(sigsize,true); // all start as low auxil candidates
+
+  for (int i = 0; i < initial.size(); i++) {
+    vec<Lit> const & cl = initial[i];
+    for (int j = 0; j < cl.size(); j++)
+      low_auxil[var(cl[j])] = false;
+  }
+   
+  for (int i = 0; i < goal.size(); i++) {
+    vec<Lit> const & cl = goal[i];
+    for (int j = 0; j < cl.size(); j++)
+      low_auxil[var(cl[j])] = false;
+  }
+  
+  for (int i = 0; i < universal.size(); i++) {
+    vec<Lit> const & cl = universal[i];
+    for (int j = 0; j < cl.size(); j++)
+      low_auxil[var(cl[j])] = false;
+  } 
+
+  for (int i = 0; i < step.size(); i++) {
+    vec<Lit> const & cl = step[i];
+    for (int j = 0; j < cl.size(); j++)
+      if (var(cl[j]) >= sigsize)        
+        low_auxil[var(cl[j])-sigsize] = false;
+  } 
+  
+  int low_auxil_cnt = 0;
+  for (int i = 0; i<sigsize; i++)
+    if (low_auxil[i])
+      low_auxil_cnt++;
+  
+  printf("// Detected and moved %d low auxiliary variables\n",low_auxil_cnt);
+  
+  if (low_auxil_cnt > 0) { // update the encoding
+    for (int i = 0; i < step.size(); i++) {
+      vec<Lit>& cl = step[i];
+      for (int j = 0; j < cl.size(); j++)
+        if (var(cl[j]) < sigsize && low_auxil[var(cl[j])])
+          cl[j] = mkLit(var(cl[j])+sigsize,sign(cl[j]));
+    }  
+  }  
+}
+
 static void SIGINT_exit(int signum) {
   printf("// *** INTERRUPTED ***\n");
   if (opt_verbose)
@@ -1531,42 +1577,6 @@ static void SIGINT_exit(int signum) {
   fflush(stdout);
   _exit(1); 
 }
-
-/*
-void testCWBox() {
-  CWBox* top = 0;
-  CWBox* a;
-  CWBox* b;
-  CWBox* c;
-  
-  vec<Lit> clause;
-  clause.push(mkLit(0));
-  
-  a = new CWBox(clause);
-    
-  clause[0] = mkLit(1);
-  b = new CWBox(clause);
-  
-  clause[0] = mkLit(2);
-  c = new CWBox(clause);
-  
-  printf("Integrate c: ");  
-  c->integrate(&top);  
-  printCWBox(top);
-  
-  printf("Integrate b: ");  
-  b->integrate(&top);  
-  printCWBox(top);  
-  
-  printf("Integrate a: ");  
-  a->integrate(&top);  
-  printCWBox(top);  
-  
-  printf("Disintegrate a: ");  
-  a->disintegrate();  
-  printCWBox(top);  
-}
-*/
 
 int main(int argc, char** argv)
 {
@@ -1613,6 +1623,9 @@ int main(int argc, char** argv)
 
     bool added_new_var = ensure_single_unit_goal(sigsize,initial,goal,universal,step);        
     
+    if (opt_move_auxil)
+      auxiliary_variables_to_upper(sigsize,initial,goal,universal,step);     
+        
     global_context = new SolvingContext();
     global_context->artificial_goal_var = added_new_var;
     
