@@ -86,6 +86,10 @@ static IntOption opt_startphase("MAIN", "startphase", "Initial phase to start wi
 static BoolOption opt_minimize ("MAIN", "min", "(Inductively) minimize learned clauses.", true); 
 static IntOption opt_induction ("MAIN", "ind", "Use induction for minimization (1 = one pass, 2 = iterate until fixpoint).", 2, IntRange(0,2)); 
 
+static IntOption opt_proactive ("MAIN", "proactive", "Limiting proactive pushing (0 - only once a phase, 1 - something lazy, 2 - very proactive).", 1, IntRange(0,2));
+
+static BoolOption opt_stars ("MAIN", "stars", "Visualize model length in each phase by drawing stars (incompatible with pphase).", false); 
+
 static BoolOption opt_print_solution ("MAIN", "psol", "Print the solution assignment (for dimspec format inputs).", false);
 static BoolOption opt_move_auxil ("MAIN", "aux", "Move low auxiliary variables to upper signature.", true);
 
@@ -154,11 +158,13 @@ struct CWBox {
   vec<Lit> data;         // for clause the actual literals, for witness the negated state as a clause
   ABSTRACTION_TYPE abs;  // abstraction of the above
   
+  CWBox*  other;  // the other of the two
+  
   CWBox*  next;    // to form a linked list  
   CWBox** prev;    // to delete from anywhere
   
-  CWBox() : abs(0), next(0), prev(0) { id = ids ++; }
-  CWBox(ABSTRACTION_TYPE a, vec<Lit> const & d) : abs(a), next(0), prev(0) { d.copyTo(data); id = ids ++; } 
+  CWBox() : abs(0), other(0), next(0), prev(0) { id = ids ++; }
+  CWBox(ABSTRACTION_TYPE a, vec<Lit> const & d) : abs(a), other(0), next(0), prev(0) { d.copyTo(data); id = ids ++; } 
     
   void integrate(CWBox** holder) {  // like insert
     assert(holder);
@@ -243,16 +249,19 @@ struct SolvingContext {
   // Well, in general this is a little more complicated: remember there is S_in, S_out, and S_reg in the  Niklases' paper -- the low signature should contain S_in and S_reg
 
   int phase;
-  int least_affected_layer;  
+  int least_affected_layer;
   
   vec<MarkingSolver*> solvers;
   
-  CBoxVec layers;         // here sit the clauses
+  CBoxVec layers;         // here sit the clauses   
+  CBoxVec push_requests;  // and here
+  CBoxVec witnesses;      //  or here their respective bros
    
   vec< OblDeque > obligations;
         
   // statistics
   int pushing_request;
+  int pushing_nontriv_request;
   int pushing_success;
   
   int oblig_processed;
@@ -279,17 +288,20 @@ struct SolvingContext {
      
   SolvingContext() : phase(-1),
                      least_affected_layer(0),
-                     pushing_request(0), pushing_success(0),
+                     pushing_request(0), pushing_nontriv_request(0), pushing_success(0),
                      oblig_processed(0), oblig_subsumed(0), oblig_sat(0), oblig_unsat(0), oblig_resched_clause(0), oblig_resched_subs(0),                                                                                                        
                      clauses_dersolver(0), clauses_univ(0), clauses_strengthened(0),                                         
                      solver_call_extension(0), solver_call_push(0),                     
                      minim_attempts(0), minim_solver(0), minim_explicit(0), minim_push(0),
                      model_min_layer(0), model_max_depth(0),                       
-                     called(0),
                      initial_obligation(0,0)
   { }    
 
   void deleteClause(CWBox *cl_box) {
+    if (cl_box->other) {
+      cl_box->other->disintegrate();
+      delete cl_box->other;
+    }
     cl_box->disintegrate();
     delete cl_box;
   }
@@ -313,10 +325,11 @@ struct SolvingContext {
   void printStat(bool between_phases = false) {
     if (opt_statpushing) {
       printf("\nClause pushing:\n");                     
-      printf("\t%d pushes attempted.\n",pushing_request);
-      printf("\t%d clauses pushed.\n", pushing_success);                     
+      printf("\t%d requests handled.\n",pushing_request);
+      printf("\t%d proper - %d clauses pushed.\n", pushing_nontriv_request,pushing_success);                     
     
-      pushing_request = 0;           
+      pushing_request = 0;     
+      pushing_nontriv_request = 0;
       pushing_success = 0;      
     }
        
@@ -487,8 +500,7 @@ struct SolvingContext {
   vec<int> minimark_in;
   vec<int> minimark_out;
   vec<int> rnd_perm;  
-   
-  int called; 
+     
    
   bool callSolver(int index, CLOCK_CLOCKS cc,       // calls the index-th solver, under then give assumptions filtered_ma plus the layer assumptions
                   bool compute_conflict,          // request for returning (minimized, if flag set) appropriate conflict clause (to be delivered in conflict_out), 
@@ -753,6 +765,34 @@ struct SolvingContext {
     return res;
   }
   
+  /* 
+    A new strong clause is coming to this layer, so it could initiate some pushing by killing a witness.
+  */
+  int pruneWitnesses(ABSTRACTION_TYPE abs,
+                     vec<Lit>const & clause,   //the potentially subsuming clause
+                     int from) {  
+    if (from > phase)
+      return 0;
+    
+    int res = 0;
+    
+    for(CWBox* wit_box = witnesses[from]; wit_box != 0; /*iteration inside*/) {
+      if (absSubsumes(abs,wit_box->abs) && subsumes(clause,wit_box->data)) { // clause will need a new witness
+        CWBox* tmp_box = wit_box;
+        wit_box = wit_box->next;
+        
+        res++;
+        
+        tmp_box->disintegrate();
+        tmp_box->integrate(&push_requests[from]);
+      } else {
+        wit_box = wit_box->next;
+      }    
+    }
+    
+    return res;
+  }
+  
   /*
     a new clause (either just derived or pushed) is coming to this clause
   */
@@ -763,7 +803,7 @@ struct SolvingContext {
     //printf("Inserting %s-clause to layer %d to kill ma in layer %d. ",target_layer <= phase ? "N" : "U",target_layer,first_questionable+1);
            
     for (int i = target_layer; i >= upmost_layer; i--) {
-      if (!stopped) {             
+      if (!stopped) {    
         int res = pruneLayerByClause(abs,clause,i,/* maybe_weak (?)*/ i <= first_questionable /* otherwise don't test forward */ );
                                     
         if (res < 0) { //got subsumed here; will not subsume anymore
@@ -775,16 +815,18 @@ struct SolvingContext {
           if (opt_earlystop) // true by default!
             return;          
         } else {
+          if (i < least_affected_layer)  // could do this once outside the loop, but notice the return above which would complicate it even more
+            least_affected_layer = i;
+        
           clauses_strengthened += res;
           sum_cl_killed += res;
           // printf("Kills %d in %d. ",res,i);
           
           int obl_res = pruneObligations(abs,clause,i,target_layer+1); // the new clause is still strong, could it kill/push some obligations here?
           sum_ob_pushed += obl_res;
-          oblig_subsumed += obl_res;      
+          oblig_subsumed += obl_res;
           
-          if (least_affected_layer > i)
-            least_affected_layer = i;          
+          int wit_res = pruneWitnesses(abs,clause,i);
         }
       }
                  
@@ -796,30 +838,102 @@ struct SolvingContext {
     
     //printf("Killed %d, went %d steps deep and subsumed %d obligations\n",sum_cl_killed,target_layer-stopped,sum_ob_pushed);    
   }
+      
+  /* 
+    new clause, push clause, or a clause with a killed witness is looking for new one
+  */
+  void lookForWitness(CWBox * cl_box, int index) {
+    vec<Lit> & clause = cl_box->data;
+   
+    solver_call_push++;    
+    pushing_request++;
+    if (cl_box->other->data.size())
+      pushing_nontriv_request++;
+      
+    filtered_ma.clear();
+    for (int l = 0; l < clause.size(); l++) {
+      assert(var(clause[l]) >= sigsize);
+      filtered_ma.push(mkLit(var(clause[l])-sigsize,!sign(clause[l])));      
+    }
+    filtered_ma.push(mkLit(2*sigsize, false));                   
+    
+    if (callSolver(index,clock_SOLVER_PUSH,false,false)) {
+      MarkingSolver &model_solver = *solvers[index];      
+      
+      // extract the witness
+      vec<Lit> & ma = cl_box->other->data;
+      ma.clear();      
+      //like when extracting ma normally
+      for (int j = 0; j < sigsize; j++) {
+        assert(model_solver.model[j+sigsize] != l_Undef);  
+        if (bridge_variables[j])                                              
+          ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and unnegated
+      }
+      // and we don't add the initial marker
+      cl_box->other->abs = calcAbstraction(ma);      
+      
+      cl_box->other->integrate(&witnesses[index]);
+    } else {     // pushed
+      marks_tmp.clear();
+      marks_tmp.push(index+1);
+    
+      pushing_success++;
+    
+      handleNewClause(index+1,index+1,index+1,cl_box->abs,clause,marks_tmp); /* it should not get subsumed there! */
+    
+      cl_box->disintegrate();
+      cl_box->integrate(&layers[index+1]);
+      cl_box->other->integrate(&push_requests[index+1]);                                        
+    }
+  }
+  
+  bool doSomePushing(int upto) {  
+    // NOTE: don't call with ( upto > phase ) before the phase is over, otherwise the unsat claim doesn't hold     
+    for (int i = least_affected_layer; i < upto; i++) {
+      while (push_requests[i]) {
+        CWBox* req_box = push_requests[i];
+        req_box->disintegrate();
+        lookForWitness(req_box->other,i);
+      }
+      
+      if (layers[i] == 0) { 
+        printf("// UNSAT: repetition detected!\n");
+        if (opt_verbose)
+          printf("// Delta-layer %d emptied by pushing!\n",i);            
+        return true;
+      }
+    }
+    
+    least_affected_layer = upto;
+      
+    return false;
+  }
   
   Obligation initial_obligation;
   
   bool processObligations() {
-    int obl_top = phase + 1;  // the lowest index where there is possibly any obligation to look for    
+    int obl_top = 0; 
   
     for (;;) {
-      // first do all the necessary pushing 
-      // (TODO: maybe stop before the current value of obl_top?)
-      // (TODO: maybe keep note of where from it makes sense to start looking for push_requests?)      
-      for (int i = 0; i < phase /*cannot push from L_{phase}, there is not L_{phase+1} yet*/; i++) {        
-        if (layers[i] == 0) {
-          printf("// UNSAT: repetition detected!\n");
-          if (opt_verbose)
-            printf("// Delta-layer %d emptied by pushing!\n",i);            
-          return true;
-        }
-      }
-      
+      // the old style, very proactive pushing
+      if (opt_proactive == 2 && doSomePushing(phase))
+        return true;
+        
       // now handle obligations
       Obligation* ob;
       while (obl_top <= phase && obligations[obl_top].size() == 0)
         obl_top++;      
+      
+      if (opt_proactive == 1) {
+        int save = pushing_success;
+               
+        if (doSomePushing(std::min(obl_top,phase)))
+          return true;
         
+        if (pushing_success > save)          
+          continue; // an obligation could have died, check again
+      }
+      
       if (obl_top > phase) {
         ob = &initial_obligation;        
       } else {
@@ -872,7 +986,7 @@ struct SolvingContext {
         if (opt_resched == 3)
           new_top = 1; //fast forward
         else if (opt_resched == 2)
-          new_top = (model_idx == 1) ? 1 : model_idx-1; // a little forward
+          new_top = (model_idx <= 1) ? 1 : model_idx-1; // a little forward
         else
           new_top = model_idx;               
 
@@ -892,7 +1006,7 @@ struct SolvingContext {
         new_ob->abs = calcAbstraction(ma);
 
         if (ob->depth > 0)   // the initial guy is never stored
-          obligations[obl_top].push_back(ob);
+          obligations[obl_top].push_back(ob);        
         obligations[new_top].push_back(new_ob);
         
         obl_top = new_top; // follow him forward       
@@ -918,7 +1032,7 @@ struct SolvingContext {
           } while (top_ob->depth > 0);
           
           assert(top_ob);
-          assert(top_ob == &initial_obligation); //this one doesn't go in any more
+          assert(top_ob == &initial_obligation); //this one doesn't go in anymore
           
           return true;                
         }        
@@ -998,7 +1112,13 @@ struct SolvingContext {
             handleNewClause(target_layer_out+1,model_idx,0,abs,conflict_out,marks_tmp);
             
             CWBox *clbox = new CWBox(abs,conflict_out);
-            clbox->integrate(&layers[target_layer_out+1]);    
+            clbox->integrate(&layers[target_layer_out+1]);
+  
+            CWBox *prbox = new CWBox();
+            prbox->integrate(&push_requests[target_layer_out+1]);
+            
+            clbox->other = prbox;
+            prbox->other = clbox;            
           }                   
 
           // Experiment temporary - very stupid repetition test:
@@ -1018,34 +1138,37 @@ struct SolvingContext {
     assert(initial_obligation.ma.size() == 0);
     initial_obligation.ma.push(mkLit(2*sigsize,  true)); // not (L_initial)                 
     
-    layers.push();      // the inducive layer    
-    obligations.push(); // those surviving till next phase 
+    layers.push();      // for the inducive layer    
+    obligations.push(); // for those surviving till the end of the phase (for recovering the model path)
     
     clock_StartCounter(clock_MAIN);
     
-    least_affected_layer = 1;
-    
     for (phase = 0; ; phase++) {
-      layers.push();                             // place for the new layer                  
-      if (layers[phase])                          // inductive layer non-empty ?
+      layers.push();                                // place for the new layer                  
+      if (layers[phase])                            // inductive layer non-empty ?
         layers[phase]->relocate(&layers[phase+1]);  // shift it by one and make the phase-th one empty
       
-      assert(layers[phase] == 0);      
+      assert(layers[phase] == 0);
 
       obligations.push();      // the zero-th will be always empty: obligation at index i, has its ma inside L_i
+      push_requests.push();
+      witnesses.push();
       
       solvers.push(new MarkingSolver());      
       MarkingSolver &solver = *solvers.last();            
       solver.initilazeSignature(2*sigsize+1);      
-              
+      
+      if (doSomePushing(phase)) // may already add some clauses to the new solver
+        return;
+      
       vec<int> marker; /*empty*/
       
       for (int i = 0; i < rest_clauses.size(); i++)
         solver.addClause(rest_clauses[i],marker);
       
-      // insert from univs
+      // insert from the inductive layer
       for (CWBox* layer_box = layers[phase+1]; layer_box != 0; layer_box = layer_box->next)           
-        solver.addClause(layer_box->data,marker);
+        solver.addClause(layer_box->data,marker);           
 
       if (phase == 0) {
         marker.push(0); // but 0-th layer will remain empty
@@ -1057,56 +1180,15 @@ struct SolvingContext {
                 
           CWBox *clbox = new CWBox(calcAbstraction(goal_clause),goal_clause);
           clbox->integrate(&layers[0]);
+  
+          CWBox *prbox = new CWBox();
+          prbox->integrate(&push_requests[0]);
+            
+          clbox->other = prbox;
+          prbox->other = clbox;     
           
           solver.addClause(goal_clause,marker);         
         }
-      } else { 
-        // here we do the pushing
-        for (int i = least_affected_layer; i < phase; i++) {        
-          for (CWBox* cl_box = layers[i]; cl_box != 0; /*increment inside*/) {          
-            vec<Lit> & clause = cl_box->data;     
-            solver_call_push++;            
-              
-            filtered_ma.clear();
-            for (int l = 0; l < clause.size(); l++) {
-              assert(var(clause[l]) >= sigsize);
-              filtered_ma.push(mkLit(var(clause[l])-sigsize,!sign(clause[l])));      
-            }
-            filtered_ma.push(mkLit(2*sigsize, false));                   
-            
-            pushing_request++;
-            
-            if (callSolver(i,clock_SOLVER_PUSH,false,false)) {
-              // SAT -> no pushing
-              cl_box = cl_box->next;
-              
-            } else {     
-              // UNSAT -> push
-              marks_tmp.clear();
-              marks_tmp.push(i+1);
-            
-              pushing_success++;
-            
-              handleNewClause(i+1,i+1,i+1,cl_box->abs,clause,marks_tmp); /* it should not get subsumed there! */
-                       
-              CWBox* tmp_box = cl_box;
-              cl_box = cl_box->next;
-                     
-              tmp_box->disintegrate();
-              tmp_box->integrate(&layers[i+1]);                                      
-            }          
-          }
-      
-          // test empty               
-          if (layers[i] == 0) {
-            printf("// UNSAT: repetition detected!\n");
-            if (opt_verbose)
-              printf("// Delta-layer %d emptied by pushing!\n",i);            
-            return;
-          }
-        }
-        
-        least_affected_layer = phase;
       }
       
       if (!solver.simplify()) {
@@ -1120,11 +1202,25 @@ struct SolvingContext {
         printf("\n------------------------------------------------------------------\n");        
       } 
       
-      if (phase >= opt_startphase) {                                   
-        if (processObligations())
-          return; // problem solved                 
+      if (phase >= opt_startphase) {           
+        bool result = processObligations();
+
+        if (opt_stars && !((opt_verbose && opt_pphase))) {
+          for (int i = 0; i <= phase; i++)
+            if (i < model_min_layer)
+              printf(".");
+            else
+              printf("*");
+          printf("\n");
+
+          model_min_layer = phase+1;
+          model_max_depth = 0;
+        }
+
+        if (result)            
+          return; // problem solved                
       }
-                  
+       
       if (opt_verbose && opt_pphase) {
         printStat(true);                
       }
