@@ -794,7 +794,7 @@ struct SolvingContext {
   }
   
   /*
-    a new clause (either just derived or pushed) is coming to this clause
+    a new clause (either just derived or pushed) is coming to this layer
   */
   void handleNewClause(int target_layer, int first_questionable, int upmost_layer, ABSTRACTION_TYPE abs, vec<Lit> const & clause, vec<int> const& markers) {  
     int stopped = 0;    
@@ -826,7 +826,7 @@ struct SolvingContext {
           sum_ob_pushed += obl_res;
           oblig_subsumed += obl_res;
           
-          int wit_res = pruneWitnesses(abs,clause,i);
+          pruneWitnesses(abs,clause,i);
         }
       }
                  
@@ -840,7 +840,7 @@ struct SolvingContext {
   }
       
   /* 
-    new clause, push clause, or a clause with a killed witness is looking for new one
+    new clause, push clause, or a clause with a killed witness is looking for a new one
   */
   void lookForWitness(CWBox * cl_box, int index) {
     vec<Lit> & clause = cl_box->data;
@@ -1119,16 +1119,7 @@ struct SolvingContext {
             
             clbox->other = prbox;
             prbox->other = clbox;            
-          }                   
-
-          // Experiment temporary - very stupid repetition test:
-          for (int i = 1; i < phase; i++)
-            if (layers[i] == 0) {
-              printf("// UNSAT: repetition detected!\n");
-              if (opt_verbose)
-                printf("// Delta-layer %d emptied by subsumption!\n",i);            
-              return true;              
-            }
+          }
         }
       }
     }     
@@ -1173,7 +1164,7 @@ struct SolvingContext {
       if (phase == 0) {
         marker.push(0); // but 0-th layer will remain empty
         
-        // the single literal single clause + all the boost clauses (if applicable)
+        // the single literal single clause
         for (int i = 0; i < goal_clauses.size(); i++) {
           vec<Lit> & goal_clause = goal_clauses[i];               
           sort(goal_clause);
