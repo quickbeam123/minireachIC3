@@ -602,7 +602,8 @@ struct SolvingContext {
         for (int i = 0; i < minimark_in.size()-2; i++) {
           solver.setAssump(size + i, indy);
           if (solver.simplify(),solver.solve())
-            break;
+            break; // TODO: this is where we could already take a good witness (would save one call)
+          
           target_layer_out = minimark_in[i+1]; //makes sense even with inductive_layer_idx, which is the last but one value       
           minim_push++;
         }       
