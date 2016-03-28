@@ -25,7 +25,6 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 using namespace Minisat;
 
 MarkingSolver::MarkingSolver() : base_marker_index(0) {}
-MarkingSolver::~MarkingSolver() {}
 
 void MarkingSolver::initilazeSignature(int number_of_basic_vars) {
   for (int i = 0; i < number_of_basic_vars; i++ )
@@ -93,8 +92,11 @@ void MarkingSolver::preprocessConflict(vec<Lit>& out_conflict, vec<int>& out_mar
     if (v < base_marker_index)
       out_conflict.push(l);
     else {
-      assert(!sign(l));      
-      out_markers.push(var2id[v]);
+      std::map<Var,int>::iterator it = var2id.find(v);
+      if (it != var2id.end()) { // because it can also be one of the connectors (see DisjunctionMaintainingMarkingSolver)
+        assert(!sign(l));
+        out_markers.push(var2id[v]);
+      }
     }         
   }
 }

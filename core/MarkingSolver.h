@@ -30,7 +30,6 @@ namespace Minisat {
 class MarkingSolver : public Solver {
   public:
     MarkingSolver();
-    ~MarkingSolver();
   
     void initilazeSignature(int number_of_basic_vars);              // the solver may allocate additional variables to serve as markers; so after this called, newVar shouldn't be called anymore   
     bool addClause (const vec<Lit>& ps, const vec<int>& markers);   // Add a clause to the solver, enriched with a set of markers (markers must be registered beforehand);
@@ -52,7 +51,6 @@ class MarkingSolver : public Solver {
   protected:    
     int base_marker_index;
   
-    
     std::map<int,Var> id2var;  // map ids->vars, stores the variable currently assigned to a marker with the given id    
     std::map<Var,int> var2id;  // for storing the inverse map
 };
