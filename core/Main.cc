@@ -286,7 +286,7 @@ struct SolvingContext {
   int model_max_depth;   
      
   SolvingContext() : phase(-1),
-                     least_affected_layer(0),
+                     least_affected_layer(1), // not 0; with the new system; the single goal clauses is effectively empty and therefore unpush-able
                      pushing_request(0), pushing_nontriv_request(0), pushing_success(0),
                      oblig_processed(0), oblig_subsumed(0), oblig_sat(0), oblig_unsat(0), oblig_resched_clause(0), oblig_resched_subs(0),                                                                                                        
                      clauses_dersolver(0), clauses_univ(0), clauses_strengthened(0),                                         
@@ -903,9 +903,9 @@ struct SolvingContext {
           printf("// Delta-layer %d emptied by pushing!\n",i);            
         return true;
       }
+      
+      least_affected_layer = upto;
     }
-    
-    least_affected_layer = upto;
       
     return false;
   }
