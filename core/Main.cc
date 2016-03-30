@@ -285,7 +285,8 @@ struct SolvingContext {
 
   void deleteClause(CWBox *cl_box) {
     if (cl_box->other) {
-      cl_box->other->disintegrate();
+      if (cl_box->other->prev) // was still integrated
+        cl_box->other->disintegrate();
       delete cl_box->other;
     }
     cl_box->disintegrate();
@@ -338,7 +339,7 @@ struct SolvingContext {
     if (opt_statreaching) {
       printf("\nReaching states:\n");
       printf("\t%d found,\n",reaching_states.size() - reaching_found);
-      printf("\t%d in total.\n:",reaching_states.size());
+      printf("\t%d in total.\n",reaching_states.size());
       
       reaching_found = reaching_states.size();
     }
@@ -635,11 +636,11 @@ struct SolvingContext {
       if (absSubsumes(abs,layer_box->abs) && subsumes(clause,layer_box->data)) {
         CWBox* tmp_box = layer_box;
         layer_box = layer_box->next;
-        //printf("subsumed clause %d\n",tmp_box->id); 
+        LOG(printf("subsumed clause %d\n",tmp_box->id);)
         deleteClause(tmp_box);
         res++;
       } else if (testForWeak && absSubsumes(layer_box->abs,abs) && subsumes(layer_box->data,clause)) {
-        //printf("subsumed by %d\n",layer_box->id);        
+        LOG(printf("subsumed by %d\n",layer_box->id);)
         assert(res == 0);        
         return -1;
       } else {
@@ -871,7 +872,8 @@ struct SolvingContext {
               solvers[i]->disjoinWithUnits(reaching_states[j]);
           
           // req_box dies
-          req_box->disintegrate();
+          assert(!req_box->prev);
+          // req_box->disintegrate(); // should have been disintegrated when this may-chain started
           delete req_box;
           
           return true;
@@ -915,7 +917,7 @@ struct SolvingContext {
   Oblig initial_obligation;
   
   bool processObligations() {
-    int top = std::max(phase-1,0); // phase-1: to start the phase by pushing to the new, phase-ed layer before the first injection
+    int top = 0;
   
     LOG(printf("processObligations - start; phase %d, top %d\n",phase, top);)
   
@@ -1095,6 +1097,9 @@ struct SolvingContext {
             ob.alive = true;
             ob.from_clause = req_box; // starting a new may-chain
             
+            req_box->disintegrate(); // this means we only inject once (per phase)
+            req_box->prev = 0; // unintegrated !
+            
             // extract the witness
             vec<Lit> & ma = ob.ma;
             ma.clear();
@@ -1213,8 +1218,17 @@ struct SolvingContext {
         printf("\n------------------------------------------------------------------\n");        
         printf("// Starting phase %d...",phase);                
         printf("\n------------------------------------------------------------------\n");        
-      } 
+      }
       
+      // To start a phase by pushing, all we need to do is to put the push_requests of non-bad clauses back
+      for (int i = 1; i < phase-1; i++) {
+        LOG(printf("Resurrecting requests for %i.\n",i);)
+        for (CWBox* layer_box = layers[i]; layer_box != 0;layer_box = layer_box->next) {
+          if (layer_box->other)
+            layer_box->other->integrate(&push_requests[i]);
+        }
+      }
+        
       if (phase >= opt_startphase) {           
         if (processObligations())
           return; // problem solved
