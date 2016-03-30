@@ -805,7 +805,7 @@ struct SolvingContext {
     for (int i = 0; i < our_ma.size(); i++) {
       assert(var(our_ma[i]) >= sigsize);
       if (var(our_ma[i]) < 2*sigsize) { 
-        if (bridge_variables[var(our_ma[i])-sigsize])
+        // if (bridge_variables[var(our_ma[i])-sigsize]) - we do the filtering when storing the ma already
           filtered_ma.push(mkLit(var(our_ma[i])-sigsize,!sign(our_ma[i])));
       } else if (our_ma[i] != goal_lit) { // goal lit could be there to make subsumption work
         filtered_ma.push(our_ma[i]);      // this is the initial / step marker
@@ -899,8 +899,8 @@ struct SolvingContext {
       ma.clear();
       for (int j = 0; j < sigsize; j++) {
         assert(model_solver.model[j+sigsize] != l_Undef);
-        // if (bridge_variables[j]) // careful, the bridgevar trick is not to be compatible with model for printing and reaching states maintenance
-        ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True)); // the literals are negated ("stored in a clause form")
+        if (bridge_variables[j]) // careful, the bridgevar trick is not to be compatible with model for printing
+          ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True)); // the literals are negated ("stored in a clause form")
       }
       // only after the previous, so that it is sorted
       ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses
@@ -1101,8 +1101,8 @@ struct SolvingContext {
 
             for (int j = 0; j < sigsize; j++) {
               assert(model_solver.model[j+sigsize] != l_Undef);  
-              // if (bridge_variables[j]) // bridge cannot be used just yet -- we are potentailly constructing a reaching state, which needs to be complete!
-              ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and negated ("as a clause")
+              if (bridge_variables[j]) // does a reaching state need to be fully specified?
+                ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and negated ("as a clause")
             }
             // only after the previous, so that it is sorted
             ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses
