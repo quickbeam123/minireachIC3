@@ -58,13 +58,13 @@ void DisjunctionMaintainingMarkingSolver::disjoinWithUnits(const vec<Lit>& units
   ensureEnoughConnectors();
   
   // define the added disjunct
-  add_tmp.clear();
-  add_tmp.push(mkLit(connectors.last(),true));
+  Lit connector = mkLit(connectors.last(),true);
   connectors.pop();
-  add_tmp.push();
   
   for (int i = 0; i < units.size(); i++) {
-    add_tmp[1] = units[i];
+    add_tmp.clear();
+    add_tmp.push(connector);
+    add_tmp.push(units[i]);
     addClause_(add_tmp);
   }
 }

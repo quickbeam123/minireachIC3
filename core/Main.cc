@@ -338,6 +338,7 @@ struct SolvingContext {
     if (opt_statreaching) {
       printf("\nReaching states:\n");
       printf("\t%d found,\n",reaching_states.size() - reaching_found);
+      printf("\t%d in total.\n:",reaching_states.size());
       
       reaching_found = reaching_states.size();
     }
@@ -819,7 +820,8 @@ struct SolvingContext {
         if (ob_from.from_clause) { // a may obligation
           LOG(printf("Reaching states found\n");)
         
-          oblig_hit_reaching++;
+          if (model_idx)
+            oblig_hit_reaching++;
         
           // if there is a clause, it is now bad
           CWBox* req_box = ob_from.from_clause;
@@ -864,11 +866,9 @@ struct SolvingContext {
           }
           
           // insert new reaching states into solvers
-          /*
           for (int i = 0; i < solvers.size(); i++)
             for (int j = new_reaching_start; j < reaching_states.size(); j++)
               solvers[i]->disjoinWithUnits(reaching_states[j]);
-          */
           
           // req_box dies
           req_box->disintegrate();
@@ -1174,11 +1174,10 @@ struct SolvingContext {
       
       // univesally define what the goal_lit stands for:
       solver.disjoinWithCNF(goal_clauses);
-      /*
+      
       for (int i = 0; i < reaching_states.size(); i++) {
         solver.disjoinWithUnits(reaching_states[i]);
       }
-      */
       
       vec<int> marker; /*empty*/
       
