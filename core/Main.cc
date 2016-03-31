@@ -225,14 +225,13 @@ struct CBoxVec {
 };
 
 struct SolvingContext {
-  Lit goal_lit;
-  // bool artificial_goal_var;
   int sigsize;
 
   Clauses goal_clauses;
   Clauses rest_clauses;
   
-  Clauses reaching_states; // discovered states which reach the goal (to be disjioned with the goal formula)
+  // A DNF of discovered states which reach the goal, stored in a SAT solver using a devilish dual rail encoding for fast subsumption checks
+  Solver reaching_states;
   
   vec<bool> bridge_variables; 
   // TODO: this idea should be extended up to the point where the low signature part of the solver is only as big as the bridge (the rest of the variables are just rubbish!)
@@ -339,10 +338,10 @@ struct SolvingContext {
   
     if (opt_statreaching) {
       printf("\nReaching states:\n");
-      printf("\t%d found,\n",reaching_states.size() - reaching_found);
-      printf("\t%d in total.\n",reaching_states.size());
+      printf("\t%d found,\n",reaching_states.nClauses() - reaching_found);
+      printf("\t%d in total.\n",reaching_states.nClauses());
       
-      reaching_found = reaching_states.size();
+      reaching_found = reaching_states.nClauses();
     }
   
     if (opt_statclauses) {
@@ -476,6 +475,8 @@ struct SolvingContext {
   
   vec<int> marks_tmp;
   
+  vec<Lit> state_tmp; // for constructing states to be added to reaching
+  
   // INPUT for callSolver()
   vec<Lit> filtered_ma;        // ma without non-bridge variables
   
@@ -561,7 +562,6 @@ struct SolvingContext {
                 if (l != indy && var(l) < sigsize)
                   conflict_out.push(mkLit(var(l)+sigsize,!sign(l)));   // negate back and shift
               }
-              conflict_out.push(goal_lit);                       
               
               marks_tmp.clear();
               marks_tmp.push(assumption_mark_id); 
@@ -651,81 +651,6 @@ struct SolvingContext {
                 
     return res;
   }
-     
-  
-  /* 
-    A new strong clause is coming to this layer, so it could initiate some pushing by killing a witness.
-  */
-  /*
-  int pruneWitnesses(ABSTRACTION_TYPE abs,
-                     vec<Lit>const & clause,   //the potentially subsuming clause
-                     int from) {  
-    if (from > phase)
-      return 0;
-    
-    int res = 0;
-    
-    for(CWBox* wit_box = witnesses[from]; wit_box != 0; ) { //iteration inside
-      // to make subsumptions by layer clauses work, we need to store goal_lit with all ma's and witnesses
-    
-      if (absSubsumes(abs,wit_box->abs) && subsumes(clause,wit_box->data)) { // clause will need a new witness
-        CWBox* tmp_box = wit_box;
-        wit_box = wit_box->next;
-        
-        res++;
-        
-        tmp_box->disintegrate();
-        tmp_box->integrate(&push_requests[from]);
-      } else {
-        wit_box = wit_box->next;
-      }    
-    }
-    
-    return res;
-  }
-  */
-  
-    /* 
-    A new strong clause is coming to this layer, maybe some obligations will be pushed back.
-    (not killed, actually, they all wait for the phase to be over, since they could be somebody's parents)
-  */
-  /*
-  int pruneObligations(ABSTRACTION_TYPE abs,
-                       vec<Lit>const & clause,   //the potentially subsuming clause
-                       int from,                 //the position to work on (if out of bounds, just no-op)
-                       int relocate_to) {        //the first index where they can live (if out of bounds, just kick them out)
-    if (from > phase)
-      return 0;
-
-    if (relocate_to > phase+1)
-      relocate_to = phase+1;
-      
-    int res = 0;
-    OblDeque& obligs = obligations[from];
-    
-    OblDeque::iterator it,jt;
-    for (it = jt = obligs.begin(); it != obligs.end(); ++it) {
-      vec<Lit> &ma = (*it)->ma;
-            
-      assert(clause_sorted(ma));
-    
-      // to make subsumptions by layer clauses work, we need to store goal_lit with all ma's and witnesses
-      
-      if (absSubsumes(abs,(*it)->abs) && subsumes(clause,ma)) {
-        res++;
-        
-        if (opt_resched) { 
-          obligations[relocate_to].push_back(*it);          
-          oblig_resched_subs++;                                         
-        } else
-          delete (*it);
-      } else  // keeping it here
-        *jt++ = *it;
-    }
-    obligs.erase(jt,obligs.end());
-  
-    return res;
-  }*/
   
   /*
     a new clause (either just derived or pushed) is coming to this layer
@@ -760,38 +685,6 @@ struct SolvingContext {
     
     //printf("Killed %d, went %d steps deep and subsumed %d obligations\n",sum_cl_killed,target_layer-stopped,sum_ob_pushed);    
   }
-      
-  /* 
-    new clause, push clause, or a clause with a killed witness is looking for a new one
-  */
-  /*
-  void lookForWitness(CWBox * cl_box, int index) {
-      }
-  */
-  
-  /*
-  bool doSomePushing(int upto) {  
-    // NOTE: don't call with ( upto > phase ) before the phase is over, otherwise the unsat claim doesn't hold     
-    for (int i = least_affected_layer; i < upto; i++) {
-      while (push_requests[i]) {
-        CWBox* req_box = push_requests[i];
-        req_box->disintegrate();
-        lookForWitness(req_box->other,i);
-      }
-      
-      if (layers[i] == 0) { 
-        printf("// UNSAT: repetition detected!\n");
-        if (opt_verbose)
-          printf("// Delta-layer %d emptied by pushing!\n",i);            
-        return true;
-      }
-      
-      least_affected_layer = upto;
-    }
-      
-    return false;
-  }
-  */
   
   // the positive part of extending is shared for both injection and proper extension
   // the negative done differently by each caller, assuming call to the solver returned false
@@ -809,7 +702,7 @@ struct SolvingContext {
       if (var(our_ma[i]) < 2*sigsize) { 
         // if (bridge_variables[var(our_ma[i])-sigsize]) - we do the filtering when storing the ma already
           filtered_ma.push(mkLit(var(our_ma[i])-sigsize,!sign(our_ma[i])));
-      } else if (our_ma[i] != goal_lit) { // goal lit could be there to make subsumption work
+      } else {
         filtered_ma.push(our_ma[i]);      // this is the initial / step marker
       }
     }
@@ -818,7 +711,7 @@ struct SolvingContext {
       
       MarkingSolver &model_solver = *solvers[model_idx];
       
-      if (model_idx == 0 || model_solver.value(goal_lit) == l_True) {
+      if (model_idx == 0 /*|| model_solver.value(goal_lit) == l_True  TODO: reaching detection*/ ) {
         if (ob_from.from_clause) { // a may obligation
           LOG(printf("Reaching states found\n");)
         
@@ -839,7 +732,6 @@ struct SolvingContext {
             assert(req_box->other == 0);
           }
           
-          int new_reaching_start = reaching_states.size();
           int idx = model_idx+1;
           assert(&ob_from == &obligations[idx]);
           while (idx <= phase /* actually, there should never be a may-obligation at index "phase", at least not as we currently do things */
@@ -848,6 +740,7 @@ struct SolvingContext {
             vec<Lit>& our_ma = ob.ma;
           
             // 1) the state is becoming reaching
+            /*
             reaching_states.push();
             vec<Lit>& state = reaching_states.last();
             
@@ -856,8 +749,9 @@ struct SolvingContext {
               if (var(our_ma[i]) < 2*sigsize) { // staying up, but negated -> in a state form
                 state.push(mkLit(var(our_ma[i]),!sign(our_ma[i])));
               }
-              // ignoring goal_lit and the step marker
+              // ignoring the step marker
             }
+            */
             
             LOG(printf("At %d: ",idx); printLits(state);)
             
@@ -868,7 +762,6 @@ struct SolvingContext {
           }
           
           // TODO: insert new reaching states into something ...
-          (void)new_reaching_start;
           
           // req_box dies
           assert(!req_box->prev);
@@ -905,7 +798,7 @@ struct SolvingContext {
       }
       // only after the previous, so that it is sorted
       ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses
-      ma.push(goal_lit); // to make subsumption by layer clauses work
+      
       ob_to.abs = calcAbstraction(ma);
     
       return true;
@@ -916,8 +809,8 @@ struct SolvingContext {
   Oblig initial_obligation;
   
   bool processObligations() {
-    int top = 0;
-  
+    int top = 0; // even goal clauses can be pushed now!
+    
     LOG(printf("processObligations - start; phase %d, top %d\n",phase, top);)
   
     while (top <= phase) {
@@ -949,7 +842,7 @@ struct SolvingContext {
             }
           }
           conflict_out.shrink(i-j);          
-          conflict_out.push(goal_lit);  // doing it the monotone way!          
+          // TODO: conflict_out.push(goal_lit);  // doing it the monotone way!
           sort(conflict_out);  // sort for fast subsumption checks                         
           
           ABSTRACTION_TYPE abs = calcAbstraction(conflict_out);
@@ -1043,9 +936,7 @@ struct SolvingContext {
       
       if (push_requests[top]) { // do some pushing -- TODO: later try optimizing the order in which clauses are pushed!
         LOG(printf("processObligations - pushing\n");)
-      
-        assert(top > 0);
-      
+        
         CWBox* req_box = push_requests[top];
         CWBox* cl_box = req_box->other;
         
@@ -1062,8 +953,7 @@ struct SolvingContext {
         filtered_ma.clear();
         for (int l = 0; l < clause.size(); l++) {
           assert(var(clause[l]) >= sigsize);
-          if (clause[l] != goal_lit)
-            filtered_ma.push(mkLit(var(clause[l])-sigsize,!sign(clause[l])));
+          filtered_ma.push(mkLit(var(clause[l])-sigsize,!sign(clause[l])));
         }
         filtered_ma.push(mkLit(2*sigsize, false));
 
@@ -1075,7 +965,11 @@ struct SolvingContext {
           
           MarkingSolver &model_solver = *solvers[top];
           
-          if (model_solver.value(goal_lit) == l_True) {
+          // TODO: jumped into a reaching state handling ...
+          
+          // especially when pushing from layer 0, instead of may obligation we need to make them bad immediately!
+          
+          /*if (model_solver.value(goal_lit) == l_True) {
             clauses_found_bad++;
           
             LOG(printf("Pushing failed, jumped to reachable at %d -- clause is bad\n",top);)
@@ -1088,7 +982,7 @@ struct SolvingContext {
             // TODO: here we could also try extracting the reaching state from the predecessor, but let's say we will systematically not do it (for now)
             // (we never extract states from the lower signature)
             
-          } else {
+          } else */{
           
             LOG(printf("Pushing failed, may obligation injected to %d\n",top);)
           
@@ -1110,7 +1004,7 @@ struct SolvingContext {
             }
             // only after the previous, so that it is sorted
             ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses
-            ma.push(goal_lit); // to make subsumption by layer clauses work
+            
             ob.abs = calcAbstraction(ma);
             
             // push_request stays in push_requests[top]; ob will be the thing to work on next, in the next iteration
@@ -1157,6 +1051,10 @@ struct SolvingContext {
     initial_obligation.ma.push(mkLit(2*sigsize,  true)); // not (L_initial)
     
     layers.push();      // for the inducive layer
+
+    // initialize the signature
+    for (int i = 0; i < 2*sigsize; i++)
+      reaching_states.newVar();
     
     clock_StartCounter(clock_MAIN);
     
@@ -1186,20 +1084,35 @@ struct SolvingContext {
       if (phase == 0) {
         marker.push(0); // but 0-th layer will remain empty
 
-        // the single literal single clause -- unless it is the empty clause
-        assert(goal_clauses.size() == 1);
+        // make the goal dnf the first reaching state
+        state_tmp.clear();
+        
+        // and insert it into layer 0 as a bunch of clauses
+        for (int i = 0; i < goal_clauses.size(); i++) {
+          vec<Lit> & goal_clause = goal_clauses[i];
+          assert(goal_clause.size() <= 1);
+          
+          CWBox *clbox = new CWBox(calcAbstraction(goal_clause),goal_clause);
+          clbox->integrate(&layers[0]);
+          
+          // even the goal is potentially pushable (!) -- and binary generalizations (the invariant!) -- TODO!
+          CWBox *prbox = new CWBox();
+          prbox->integrate(&push_requests[0]);
+            
+          clbox->other = prbox;
+          prbox->other = clbox;
+          
+          solver.addClause(goal_clause,marker);
+          
+          if (goal_clause.size()) { // ingore the degenerate case with an empty goal clause
+            Lit l = goal_clause[0];
+            assert(var(l)>= sigsize);
+            l = mkLit(var(l)-sigsize,sign(l)); // move down, turn into a variable in the range 0..2*sigsize-1 (dual rail)
+            state_tmp.push(mkLit(toInt(l)));   // states are only positive
+          }
+        }
 
-        vec<Lit> & goal_clause = goal_clauses[0];
-        assert(goal_clause.size() <= 1);
-        assert(goal_clause.size() == 0 || goal_clause[0] == goal_lit);
-        
-        CWBox *clbox = new CWBox(calcAbstraction(goal_clause),goal_clause);
-        clbox->integrate(&layers[0]);
-  
-        // the_goal_clause is non pushable (no push_request for it) => other remains 0
-        // effectively "bad" from the start
-        
-        solver.addClause(goal_clause,marker);
+        reaching_states.addClause(state_tmp);
       }
       
       if (!solver.simplify()) {
@@ -1327,8 +1240,6 @@ static void verifyStep(int sigsize, Clauses &initial, Clauses &goal, Clauses &un
 static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
   SolvingContext& context = *global_context;
   
-  Lit goal_lit = lit_Undef;
-     
   clock_StartCounter(clock_SIMP);      
         
   int new_sigsize;
@@ -1352,20 +1263,12 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
     simpSolver.addClause(cur_clause);
   }
   
-  assert(goal.size() == 1);
-  assert(goal[0].size() == 1);    
-  
   // goal clauses
   for (int j = 0; j < goal.size(); j++) {
+    assert(goal[j].size() <= 1);
     prepareClause(cur_clause,goal[j],sigsize,true,mkLit(2*sigsize+1));   // marked as goal (second literal is needed! otherwise minisat kills the opposite literal when the unit goal is inserted)
-    
-    goal_lit = goal[0][0];           
-    goal_lit = mkLit(var(goal_lit)+sigsize,sign(goal_lit));
-    //printf("Goal lit: "); printLit(goal_lit); printf("\n");
-    
     simpSolver.addClause(cur_clause);
   }
-  assert(goal_lit != lit_Undef);
   
   // universal clauses
   for (int j = 0; j < universal.size(); j++) {    
@@ -1382,7 +1285,14 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
   // freeze the markers, and all variables from lower signature
   simpSolver.setFrozen(2*sigsize,true);
   simpSolver.setFrozen(2*sigsize+1,true);
-  simpSolver.setFrozen(var(goal_lit),true);
+  // all the goal lit's need to be frozen! TODO: so we don't need to put the goal clauses in there at all? Do we need the goal marker at all? Simplify!
+  for (int j = 0; j < goal.size(); j++) {
+    assert(goal[j].size() <= 1);
+    if (goal[j].size()) {
+      simpSolver.setFrozen(var(goal[j][0]),true);
+    }
+  }
+  
   for (int i = 0; i < sigsize; i++) // don't eliminate lower signature variables (it is trivial, and it spoils the statistics)
     simpSolver.setFrozen(i,true);    
   for (int j = 0; j < step.size(); j++)
@@ -1478,15 +1388,6 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
   
   clock_StopPassedTime(clock_SIMP);
   
-  assert(context.goal_clauses.size() == 1);
-  assert(context.goal_clauses[0].size() <= 1); // can be empty
-  if (context.goal_clauses[0].size() == 1)
-    context.goal_lit = context.goal_clauses[0][0];
-  else 
-    context.goal_lit = lit_Undef;
-  
-  //printf("Goal lit: "); printLit(context.goal_lit); printf("\n");
-  
   context.iterativeSearch();    
   
   /*
@@ -1553,10 +1454,19 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
 
 //=================================================================================================
 
-bool ensure_single_unit_goal(int &sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
-  if (goal.size() == 1 && goal[0].size() == 1)
-    return false;
-    
+void ensure_dnf_goal(int &sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
+
+  bool ok = true;
+
+  for (int i = 0; i < goal.size(); i++)
+    if (goal[i].size() > 1) {
+      ok = false;
+      break;
+    }
+  
+  if (ok)
+    return;
+
   vec<Lit> cur;
 
   // uses the original sigsize value thoughout, but in fact one new variable:
@@ -1586,8 +1496,7 @@ bool ensure_single_unit_goal(int &sigsize, Clauses &initial, Clauses &goal, Clau
 
   // enlarge the signature:
   sigsize++;
-  printf("// Added 1 variable and 1 clause to represent the goal.\n");  
-  return true;
+  printf("// Added 1 variable and 1 clause to represent the goal.\n");
 }
 
 void auxiliary_variables_to_upper(int sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
@@ -1686,14 +1595,12 @@ int main(int argc, char** argv)
     if (opt_verbose)
       printf("// Loaded spec -- sigsize: %d, #initial: %d, #goal: %d, #universal: %d, #step: %d\n",sigsize,initial.size(),goal.size(),universal.size(),step.size());
 
-    bool added_new_var = ensure_single_unit_goal(sigsize,initial,goal,universal,step);        
+    ensure_dnf_goal(sigsize,initial,goal,universal,step);
     
     if (opt_move_auxil)
       auxiliary_variables_to_upper(sigsize,initial,goal,universal,step);     
         
     global_context = new SolvingContext();
-    (void)added_new_var;
-    // global_context->artificial_goal_var = added_new_var;
     
     signal(SIGINT, SIGINT_exit);
     analyzeSpec(sigsize,initial,goal,universal,step);
