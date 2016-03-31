@@ -36,7 +36,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include "core/Solver.h"
 #include "mtl/Sort.h"
 
-#include "core/DisjMarkingSolver.h"
+#include "core/MarkingSolver.h"
 #include "core/ClauseSet.h"
 
 #include "simp/SimpSolver.h"
@@ -226,6 +226,7 @@ struct CBoxVec {
 
 struct SolvingContext {
   Lit goal_lit;
+  // bool artificial_goal_var;
   int sigsize;
 
   Clauses goal_clauses;
@@ -239,7 +240,7 @@ struct SolvingContext {
 
   int phase;
   
-  vec<DisjunctionMaintainingMarkingSolver*> solvers;
+  vec<MarkingSolver*> solvers;
   
   CBoxVec layers;         // here sit the clauses   
   CBoxVec push_requests;  // to easily find the non-bad ones in a particular layer (this could be done differently and more sensibly)
@@ -494,7 +495,7 @@ struct SolvingContext {
                   bool induction) {               // allow using induction during minimization
                                                            
 
-    DisjunctionMaintainingMarkingSolver& solver = *solvers[index];
+    MarkingSolver& solver = *solvers[index];
 
     LOG(printf("Calling for solver %d with ma ",index); printLits(filtered_ma);)
                  
@@ -815,7 +816,7 @@ struct SolvingContext {
       
     if (callSolver(model_idx,clock_SOLVER_EXTEND,true,induct)) {
       
-      DisjunctionMaintainingMarkingSolver &model_solver = *solvers[model_idx];
+      MarkingSolver &model_solver = *solvers[model_idx];
       
       if (model_idx == 0 || model_solver.value(goal_lit) == l_True) {
         if (ob_from.from_clause) { // a may obligation
@@ -866,10 +867,8 @@ struct SolvingContext {
             idx++;
           }
           
-          // insert new reaching states into solvers
-          for (int i = 0; i < solvers.size(); i++)
-            for (int j = new_reaching_start; j < reaching_states.size(); j++)
-              solvers[i]->disjoinWithUnits(reaching_states[j]);
+          // TODO: insert new reaching states into something ...
+          (void)new_reaching_start;
           
           // req_box dies
           assert(!req_box->prev);
@@ -1074,7 +1073,7 @@ struct SolvingContext {
           
           oblig_may_injected++;
           
-          DisjunctionMaintainingMarkingSolver &model_solver = *solvers[top];
+          MarkingSolver &model_solver = *solvers[top];
           
           if (model_solver.value(goal_lit) == l_True) {
             clauses_found_bad++;
@@ -1171,18 +1170,9 @@ struct SolvingContext {
       obligations.push();      // the zero-th will be always empty: obligation at index i, has its ma inside L_i
       push_requests.push();
       
-      solvers.push(new DisjunctionMaintainingMarkingSolver());      
-      DisjunctionMaintainingMarkingSolver &solver = *solvers.last();            
-      goal_lit = solver.initilazeSignature(2*sigsize+1);
-      
-      assert(var(goal_lit)>2*sigsize); // in fact, it is the next available var, but we don't need that
-      
-      // univesally define what the goal_lit stands for:
-      solver.disjoinWithCNF(goal_clauses);
-      
-      for (int i = 0; i < reaching_states.size(); i++) {
-        solver.disjoinWithUnits(reaching_states[i]);
-      }
+      solvers.push(new MarkingSolver());      
+      MarkingSolver &solver = *solvers.last();            
+      solver.initilazeSignature(2*sigsize+1);
       
       vec<int> marker; /*empty*/
       
@@ -1195,18 +1185,21 @@ struct SolvingContext {
 
       if (phase == 0) {
         marker.push(0); // but 0-th layer will remain empty
+
+        // the single literal single clause -- unless it is the empty clause
+        assert(goal_clauses.size() == 1);
+
+        vec<Lit> & goal_clause = goal_clauses[0];
+        assert(goal_clause.size() <= 1);
+        assert(goal_clause.size() == 0 || goal_clause[0] == goal_lit);
         
-        // the single literal single goal clause
-        vec<Lit> the_goal_clause;
-        the_goal_clause.push(goal_lit);
-        
-        CWBox *clbox = new CWBox(calcAbstraction(the_goal_clause),the_goal_clause);
+        CWBox *clbox = new CWBox(calcAbstraction(goal_clause),goal_clause);
         clbox->integrate(&layers[0]);
   
         // the_goal_clause is non pushable (no push_request for it) => other remains 0
         // effectively "bad" from the start
         
-        solver.addClause(the_goal_clause,marker);
+        solver.addClause(goal_clause,marker);
       }
       
       if (!solver.simplify()) {
@@ -1334,6 +1327,8 @@ static void verifyStep(int sigsize, Clauses &initial, Clauses &goal, Clauses &un
 static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
   SolvingContext& context = *global_context;
   
+  Lit goal_lit = lit_Undef;
+     
   clock_StartCounter(clock_SIMP);      
         
   int new_sigsize;
@@ -1357,11 +1352,20 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
     simpSolver.addClause(cur_clause);
   }
   
+  assert(goal.size() == 1);
+  assert(goal[0].size() == 1);    
+  
   // goal clauses
   for (int j = 0; j < goal.size(); j++) {
     prepareClause(cur_clause,goal[j],sigsize,true,mkLit(2*sigsize+1));   // marked as goal (second literal is needed! otherwise minisat kills the opposite literal when the unit goal is inserted)
+    
+    goal_lit = goal[0][0];           
+    goal_lit = mkLit(var(goal_lit)+sigsize,sign(goal_lit));
+    //printf("Goal lit: "); printLit(goal_lit); printf("\n");
+    
     simpSolver.addClause(cur_clause);
   }
+  assert(goal_lit != lit_Undef);
   
   // universal clauses
   for (int j = 0; j < universal.size(); j++) {    
@@ -1378,6 +1382,7 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
   // freeze the markers, and all variables from lower signature
   simpSolver.setFrozen(2*sigsize,true);
   simpSolver.setFrozen(2*sigsize+1,true);
+  simpSolver.setFrozen(var(goal_lit),true);
   for (int i = 0; i < sigsize; i++) // don't eliminate lower signature variables (it is trivial, and it spoils the statistics)
     simpSolver.setFrozen(i,true);    
   for (int j = 0; j < step.size(); j++)
@@ -1411,7 +1416,7 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
   for (int i = sigsize; i < 2*sigsize+2; i++) { // the two markers didn't get eliminated!
     renaming.push();
     
-    if (!simpSolver.isEliminated(i)) {
+    if (!simpSolver.isEliminated(i)) { // the goal_lit goes in as well, that's why ma_subsumption testing works!                 
       renaming.last() = inv_renaming.size();
       inv_renaming.push(i-sigsize);      
       bridge_variables.push(simpSolver.isFrozen(i));
@@ -1441,7 +1446,7 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
       Lit l = clause[j];
       Var v = var(l);
 
-      if (v == 2*sigsize+1) { // we remeber it, but newly don't keep explicitly anymore (will later use DisjunctionMaintainingMarkingSolver instead)
+      if (v == 2*sigsize+1) { // we remeber it, but newly don't keep explicitly anymore (will later use MarkingSolver instead)
         assert(!sign(l));
         goal = true;
       } else {
@@ -1473,6 +1478,15 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
   
   clock_StopPassedTime(clock_SIMP);
   
+  assert(context.goal_clauses.size() == 1);
+  assert(context.goal_clauses[0].size() <= 1); // can be empty
+  if (context.goal_clauses[0].size() == 1)
+    context.goal_lit = context.goal_clauses[0][0];
+  else 
+    context.goal_lit = lit_Undef;
+  
+  //printf("Goal lit: "); printLit(context.goal_lit); printf("\n");
+  
   context.iterativeSearch();    
   
   /*
@@ -1486,7 +1500,7 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
     vec<bool> cur_model;
     int model_idx = 0;
     
-    printf("solution %d %d\n",sigsize,model_path.size());
+    printf("solution %d %d\n",sigsize - (context.artificial_goal_var ? 1 : 0),model_path.size());
      
     //translate to the original signature and print      
     for (int i = (opt_reversed ? 0 : model_path.size()-1); 
@@ -1520,10 +1534,10 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
       for (int j = sigsize; j < 2*sigsize; j++) {
         assert(simpSolver.model[j] != l_Undef);
         
-        // if (!context.artificial_goal_var || j < 2*sigsize-1) {
+        if (!context.artificial_goal_var || j < 2*sigsize-1) {       
           printf("%s%s%d", (j==sigsize)?"":" ", (simpSolver.model[j]==l_True)?"":"-", j-sigsize+1);
           space = true;
-        // }
+        }
                
         cur_model.push(simpSolver.model[j]==l_True);        
       }
@@ -1538,6 +1552,43 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
 }
 
 //=================================================================================================
+
+bool ensure_single_unit_goal(int &sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
+  if (goal.size() == 1 && goal[0].size() == 1)
+    return false;
+    
+  vec<Lit> cur;
+
+  // uses the original sigsize value thoughout, but in fact one new variable:
+  // v_sigsize to have a single clause, single literal goal of the original  
+       
+  // universals stay untouched + extended old goal clauses are added
+  for (int i = 0; i < goal.size(); i++) {
+    goal[i].moveTo(cur);
+    cur.push(mkLit(sigsize,true)); // ~v_sigsize
+    universal.push(cur);
+    cur.clear();
+  }
+  goal.clear();
+  
+  // just one new goal clause 
+  cur.push(mkLit(sigsize,false));  // v_sigsize
+  goal.push(cur);
+  cur.clear();
+  
+  //translate the step clauses
+  for (int i = 0; i < step.size(); i++) {
+    vec<Lit>& clause = step[i];
+    for (int j = 0; j < clause.size(); j++)
+      if (var(clause[j])>=sigsize)
+        clause[j] = mkLit(var(clause[j])+1,sign(clause[j]));
+  }
+
+  // enlarge the signature:
+  sigsize++;
+  printf("// Added 1 variable and 1 clause to represent the goal.\n");  
+  return true;
+}
 
 void auxiliary_variables_to_upper(int sigsize, Clauses &initial, Clauses &goal, Clauses &universal, Clauses &step) {
   vec<bool> low_auxil(sigsize,true); // all start as low auxil candidates
@@ -1635,10 +1686,14 @@ int main(int argc, char** argv)
     if (opt_verbose)
       printf("// Loaded spec -- sigsize: %d, #initial: %d, #goal: %d, #universal: %d, #step: %d\n",sigsize,initial.size(),goal.size(),universal.size(),step.size());
 
+    bool added_new_var = ensure_single_unit_goal(sigsize,initial,goal,universal,step);        
+    
     if (opt_move_auxil)
       auxiliary_variables_to_upper(sigsize,initial,goal,universal,step);     
         
     global_context = new SolvingContext();
+    (void)added_new_var;
+    // global_context->artificial_goal_var = added_new_var;
     
     signal(SIGINT, SIGINT_exit);
     analyzeSpec(sigsize,initial,goal,universal,step);
