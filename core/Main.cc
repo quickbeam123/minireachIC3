@@ -52,6 +52,8 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 
 #define LOG(X)
 
+#define LOG2(X) 
+
 using namespace Minisat;
 
 static StringOption opt_format  ("INPUT", "format", "Input format: currently either <aiger> or <dimspec>. Default <aiger>.", "aiger");
@@ -264,7 +266,8 @@ struct SolvingContext {
   int clauses_dersolver;
   int clauses_univ;
   int clauses_subsumed;
-  int clauses_found_bad;
+  int clauses_discovered_bad;
+  int clauses_immediately_bad;
   
   int solver_call_extension;
   int solver_call_push;
@@ -278,7 +281,7 @@ struct SolvingContext {
                      pushing_request(0), pushing_success(0),
                      oblig_must_injected(0), oblig_may_injected(0), oblig_processed(0), oblig_subsumed(0), oblig_sat_may(0), oblig_sat_must(0), oblig_hit_reaching(0), oblig_unsat(0),
                      reaching_found(0),
-                     clauses_dersolver(0), clauses_univ(0), clauses_subsumed(0), clauses_found_bad(0),
+                     clauses_dersolver(0), clauses_univ(0), clauses_subsumed(0), clauses_discovered_bad(0), clauses_immediately_bad(0),
                      solver_call_extension(0), solver_call_push(0),                     
                      minim_attempts(0), minim_solver(0), minim_explicit(0), minim_push(0)
       {}
@@ -347,7 +350,8 @@ struct SolvingContext {
     if (opt_statclauses) {
       printf("\nClauses:\n");
       printf("\t%d derived by solver (%d universals), subsumed %d.\n",clauses_dersolver,clauses_univ,clauses_subsumed);
-      printf("\t%d found bad,\n",clauses_found_bad);
+      printf("\t%d discovered bad,\n",clauses_discovered_bad);
+      printf("\t%d immediately bad.\n",clauses_immediately_bad);
       
       int inlayers = 0;
       int length_max = 0;
@@ -370,7 +374,8 @@ struct SolvingContext {
       clauses_dersolver = 0;
       clauses_univ = 0;  
       clauses_subsumed = 0;
-      clauses_found_bad = 0;
+      clauses_discovered_bad = 0;
+      clauses_immediately_bad = 0;
     }       
     
     if (opt_minimize && opt_sminim) {
@@ -475,7 +480,14 @@ struct SolvingContext {
   
   vec<int> marks_tmp;
   
-  vec<Lit> state_tmp; // for constructing states to be added to reaching
+  vec<bool> leave_out;
+  
+  vec<Lit> state_tmp;    // for constructing states to be added to reaching
+  
+  vec<Lit> reach_probe;  // for checking memebership and subsumption wrt reaching_states
+  vec<bool> the_state;   // sigsize long, store polarities for the currently exnteded state (true/false only correct under the bridge)
+  vec<bool> the_clause;  // sigsize long, true iff the corresponding var is in our current conflict clause
+  vec<bool> unremovable; // sigsize long, true if we tried removing the corresponding lit in clause and failed, because it was too strong
   
   // INPUT for callSolver()
   vec<Lit> filtered_ma;        // ma without non-bridge variables
@@ -488,12 +500,23 @@ struct SolvingContext {
   vec<int> minimark_in;
   vec<int> minimark_out;
   vec<int> rnd_perm;  
-     
+  
+  void ramdomizePerm(int size) {
+    rnd_perm.clear();
+    for (int i = 0; i < size; i++)
+    rnd_perm.push(i);
+    for (int i = size-1; i > 0; i--) {
+      int idx = rand() % (i+1);
+      int tmp = rnd_perm[idx];
+      rnd_perm[idx] = rnd_perm[i];
+      rnd_perm[i] = tmp;
+    }
+  }
    
   bool callSolver(int index, CLOCK_CLOCKS cc,       // calls the index-th solver, under then give assumptions filtered_ma plus the layer assumptions
                   bool compute_conflict,          // request for returning (minimized, if flag set) appropriate conflict clause (to be delivered in conflict_out), 
                                                   // also, target_layer_out will containt index of the least delta layer on which the conflict depends (or inductive_layer_idx for "infty")
-                  bool induction) {               // allow using induction during minimization
+                  bool injection) {
                                                            
 
     MarkingSolver& solver = *solvers[index];
@@ -506,113 +529,241 @@ struct SolvingContext {
     minimark_in.clear();
     for (int i = index; i <= phase; i++)
       minimark_in.push(i);
+    
+    // TODO: don't need to add these for injections -- anyway, the code for injections should be different, I guess...
     minimark_in.push(inductive_layer_idx);
     minimark_in.push(assumption_mark_id);
+    
+    LOG2(printVec(minimark_in);)
     
     solver.preprocessAssumptions(filtered_ma,minimark_in);    
     bool result = (solver.simplify(),solver.solve());
     
     if (!result && compute_conflict) {
       solver.preprocessConflict(conflict_out,minimark_out);
-    
-      if (opt_minimize) {
-        minim_attempts++;
       
-        minim_solver += filtered_ma.size() - conflict_out.size();
-                                 
-        //turn the conflict clause back to assumptions
-        for (int i = 0; i < conflict_out.size(); i++)
-          conflict_out[i] = ~conflict_out[i];                                      
-        solver.preprocessAssumptions(conflict_out,minimark_in);
-        Lit indy = solver.getAssump(conflict_out.size() + minimark_in.size() - 2); // the translation of the induction marker, which we never plan to remove
-        int assy_idx = conflict_out.size() + minimark_in.size() - 1;
-        Lit assy = solver.getAssump(assy_idx); // the translation of the assumption marker, which we never plan to remove
-        int size = conflict_out.size();
-                      
-        //generate random permutation
-        rnd_perm.clear(); 
-        for (int i = 0; i < size; i++)
-          rnd_perm.push(i);
-        for (int i = size-1; i > 0; i--) {
-          int idx = rand() % (i+1);
-          int tmp = rnd_perm[idx];
-          rnd_perm[idx] = rnd_perm[i];
-          rnd_perm[i] = tmp;                   
-        }        
-                
-        bool removed_something;
-        int cycle_count = 0;
-        do {                 
-          removed_something = false;
-          
-          // one pass:
-          for (int i = 0; i < size; i++) {
-            int idx = rnd_perm[i];
-            Lit save = solver.getAssump(idx);
-            if (save == indy) // already removed in previous passes
-              continue;
-
-            solver.setAssump(idx,indy);  // one assumption effectively removed (since replaced by indy)
+      if (!injection) { // we used to minimize even the injection call, but let's not do it ...
+        LOG2(printf("Solver produced clause "); printLits(conflict_out);)
+      
+        int last_added_back = -1;
+        Var weakening_marker = reaching_states.newVar();
+        
+        // weaken wrt reaching_states
+        
+        reach_probe.clear();
+        reach_probe.push(mkLit(weakening_marker,true));
+        
+        the_state.clear();
+        the_state.growTo(sigsize,false);
+        
+        // bridge is implicit here
+        for (int i = 0; i < filtered_ma.size(); i++) { // filtered_ma already in lower and in state form, but has the extra init/step marker
+          Lit l = filtered_ma[i];
+          if (var(l)<sigsize) {
+            the_state[var(l)] = sign(l);
             
-            if (induction && opt_induction) {  // inductively assume the current conflict clause            
-              //abusing conflict_out for that
-              conflict_out.clear();
-              for (int i = 0; i < size; i++) {
-                Lit l = solver.getAssump(i);
-                if (l != indy && var(l) < sigsize)
-                  conflict_out.push(mkLit(var(l)+sigsize,!sign(l)));   // negate back and shift
-              }
-              
-              marks_tmp.clear();
-              marks_tmp.push(assumption_mark_id); 
-              solver.addClause(conflict_out,marks_tmp);
-            }
-          
-            if (solver.simplify(),solver.solve()) {
-              solver.setAssump(idx,save);  // put the literal back
+            reaching_states.addClause(mkLit(weakening_marker),mkLit(toInt(l),true));
+          }
+        }
 
-              if (induction && opt_induction) {
-                solver.invalidateMarker(assumption_mark_id); // efectively delete the assumed clause                
-                assy = mkLit(solver.ensureMarkerRegistered(assumption_mark_id),true); // immediately claim it again (the same id, but a new var!) and make a lit out of it
-                solver.setAssump(assy_idx,assy);  // assume the new guy from now on
-              }
-              
-            } else {              
-              minim_explicit++;
-              removed_something = true;
+        the_clause.clear();
+        the_clause.growTo(sigsize,false);
+        for (int i = 0; i < conflict_out.size(); i++) {
+          Lit l = conflict_out[i];
+          if (var(l) < sigsize)
+            the_clause[var(l)] = true;
+        }
+        
+        // weakening loop
+        
+        for(;;) {
+          reach_probe.shrink(reach_probe.size()-1); // reset just to the state forcing marker (noop with the first pass)
+          
+          ramdomizePerm(sigsize); // just to de-systematize the order in which assumptions go into the solver
+          
+          for (int i = 0; i < sigsize; i++) {
+            int idx = rnd_perm[i];
+            if (bridge_variables[idx] && !the_clause[idx]) { // if in bridge and not in clause, assume also the other polarity than what state says
+              reach_probe.push(mkLit(toInt(mkLit(idx,!the_state[idx])),true));
             }
           }
-          cycle_count++;
-        } while (induction && (opt_induction>1) && removed_something);       
-        
-        // "pushing"         
-        target_layer_out = index;        
-        for (int i = 0; i < minimark_in.size()-2; i++) {
-          solver.setAssump(size + i, indy);
-          if (solver.simplify(),solver.solve())
-            break; // TODO: this is where we could already take a good witness (would save one call)
+
+          Lit slack = lit_Undef;
+          reaching_states.simplify();         // recycle released markers
+          // reaching_states.setConfBudget(1);   // TODO: check that this works
+          if (reaching_states.solveLimited(reach_probe) == l_True) { // everything is all right
+            LOG2(printf("Clause found weak enough.\n");)
+            break;
+          }
           
-          target_layer_out = minimark_in[i+1]; //makes sense even with inductive_layer_idx, which is the last but one value       
-          minim_push++;
-        }       
-                     
-        // prepare final version of conflict_out        
-        conflict_out.clear();
-        for (int i = 0; i < size; i++) {
-          Lit l = solver.getAssump(i);
-          if (l != indy)
-            conflict_out.push(~l);     // negate back 
-        }                          
-        
-        // cleanup
-        if (induction && opt_induction)
-          solver.invalidateMarker(assumption_mark_id);
+          for (int i = 0; i < reaching_states.conflict.size(); i++) {
+            Lit l = reaching_states.conflict[i];
+            if (var(l) != weakening_marker) {
+              slack = l;
+              break;
+            }
+          }
           
-      } else {
-        target_layer_out = inductive_layer_idx;                           
-        for (int i = 0; i < minimark_out.size(); i++)
-          if (minimark_out[i] < target_layer_out) // relying on (inductive_layer_idx < assumption_mark_id)
-            target_layer_out = minimark_out[i];      
+          if (slack == lit_Undef) {
+            assert(false);
+          
+            // error - we set off from a reachable state! report as a special return value!!!
+          } else {
+            assert(!sign(slack));
+            Lit l = toLit(var(slack));
+            
+            LOG2(printLit(l); printf(" is the next slack.\n");)
+            
+            assert(sign(l) != the_state[var(l)]); // the opposite polarity than in state, so we can add this to clause
+            conflict_out.push(l);
+            
+            last_added_back = var(l);
+            
+            assert(!the_clause[last_added_back]); // proper addition
+            the_clause[last_added_back] = true;
+          }
+          // and repeat to see if we are happy yet
+        }
+        
+        if (opt_minimize) {
+          LOG2(printf("Going to minimize (last_added_back = %d)\n",last_added_back);)
+        
+          unremovable.clear();
+          unremovable.growTo(sigsize,false);
+          if (last_added_back != -1)
+            unremovable[last_added_back] = true;
+        
+          minim_attempts++;
+        
+          minim_solver += filtered_ma.size() - conflict_out.size();
+                                   
+          //turn the conflict clause back to assumptions
+          for (int i = 0; i < conflict_out.size(); i++) {
+            conflict_out[i] = ~conflict_out[i];
+            
+            LOG2(printLit(conflict_out[i]);)
+          }
+          solver.preprocessAssumptions(conflict_out,minimark_in);
+          Lit indy = solver.getAssump(conflict_out.size() + minimark_in.size() - 2); // the translation of the induction marker, which we never plan to remove
+          int assy_idx = conflict_out.size() + minimark_in.size() - 1;
+          Lit assy = solver.getAssump(assy_idx); // the translation of the assumption marker, which we never plan to remove
+          int size = conflict_out.size();
+                        
+          //generate random permutation
+          ramdomizePerm(size);
+                  
+          bool removed_something;
+          int cycle_count = 0;
+          do {                 
+            removed_something = false;
+            
+            // one pass:
+            for (int i = 0; i < size; i++) {
+              int idx = rnd_perm[i];
+            
+              Lit save = solver.getAssump(idx);
+              if (save == indy) // already removed in previous passes
+                continue;
+
+              if (var(save) >= sigsize) {
+                assert(var(save) == 2*sigsize); // the step marker
+                continue;
+              }
+             
+              if (unremovable[var(save)])  // we tried with this one already, or we needed to added it before to make the clause implied by reaching
+                continue;
+
+              // can we remove this literal from clause?
+              reach_probe.shrink(reach_probe.size()-1); // reset just to the state forcing marker
+              for (int i = 0; i < sigsize; i++) {
+                if (bridge_variables[i] && (!the_clause[i] || i == var(save))) {
+                  reach_probe.push(mkLit(toInt(mkLit(i,!the_state[i])),true));
+                }
+              }
+              // reaching_states.setConfBudget(0);   // TODO: check that this works
+              if (reaching_states.solveLimited(reach_probe) == l_False) {
+              
+                LOG2(printLit(save); printf(" cannot be dropped from a clause.\n");)
+                
+                unremovable[var(save)] = true;
+                continue;
+              }
+              
+              LOG2(printf("Will try removing %d\n",var(save));)
+
+              solver.setAssump(idx,indy);  // one assumption effectively removed (since replaced by indy)
+              
+              if (opt_induction) {  // inductively assume the current conflict clause
+                //abusing conflict_out for that
+                conflict_out.clear();
+                for (int i = 0; i < size; i++) {
+                  Lit l = solver.getAssump(i);
+                  if (l != indy && var(l) < sigsize)
+                    conflict_out.push(mkLit(var(l)+sigsize,!sign(l)));   // negate back and shift
+                }
+                
+                // here we used to be adding the goal lit, to make the clause monotone
+                
+                marks_tmp.clear();
+                marks_tmp.push(assumption_mark_id); 
+                solver.addClause(conflict_out,marks_tmp);
+              }
+            
+              if (solver.simplify(),solver.solve()) {
+                solver.setAssump(idx,save);  // put the literal back
+
+                LOG2(printf("Putting back\n");)
+
+                if (opt_induction) {
+                  solver.invalidateMarker(assumption_mark_id); // efectively delete the assumed clause                
+                  assy = mkLit(solver.ensureMarkerRegistered(assumption_mark_id),true); // immediately claim it again (the same id, but a new var!) and make a lit out of it
+                  solver.setAssump(assy_idx,assy);  // assume the new guy from now on
+                }
+                
+              } else {              
+                minim_explicit++;
+                removed_something = true;
+
+                LOG2(printf("Removed\n");)
+                
+                // remove from the_clause
+                the_clause[var(save)] = false;
+              }
+            }
+            cycle_count++;
+          } while ((opt_induction>1) && removed_something);
+          
+          // "pushing"         
+          target_layer_out = index;        
+          for (int i = 0; i < minimark_in.size()-2; i++) {
+            solver.setAssump(size + i, indy);
+            if (solver.simplify(),solver.solve())
+              break; // TODO: this is where we could already take a good witness (would save one call)
+            
+            target_layer_out = minimark_in[i+1]; //makes sense even with inductive_layer_idx, which is the last but one value       
+            minim_push++;
+          }       
+                       
+          // prepare final version of conflict_out        
+          conflict_out.clear();
+          for (int i = 0; i < size; i++) {
+            Lit l = solver.getAssump(i);
+            if (l != indy)
+              conflict_out.push(~l);     // negate back 
+          }                          
+          
+          // cleanup
+          if (opt_induction)
+            solver.invalidateMarker(assumption_mark_id);
+            
+        } else {
+          target_layer_out = inductive_layer_idx;                           
+          for (int i = 0; i < minimark_out.size(); i++)
+            if (minimark_out[i] < target_layer_out) // relying on (inductive_layer_idx < assumption_mark_id)
+              target_layer_out = minimark_out[i];      
+        }
+        
+        reaching_states.releaseVar(mkLit(weakening_marker));
       }
     }
            
@@ -641,7 +792,7 @@ struct SolvingContext {
         deleteClause(tmp_box);
         res++;
       } else if (testForWeak && absSubsumes(layer_box->abs,abs) && subsumes(layer_box->data,clause)) {
-        LOG(printf("subsumed by %d\n",layer_box->id);)
+        LOG(printf("subsumed by "); printLits(layer_box->data); printf(" in layer %d\n",idx);)
         assert(res == 0);        
         return -1;
       } else {
@@ -688,7 +839,7 @@ struct SolvingContext {
   
   // the positive part of extending is shared for both injection and proper extension
   // the negative done differently by each caller, assuming call to the solver returned false
-  bool extend(int model_idx, Oblig& ob_from, Oblig& ob_to, bool induct, bool& solved) {
+  bool extend(int model_idx, Oblig& ob_from, Oblig& ob_to, bool injection, bool& solved) {
     solved = false;
   
     vec<Lit> &our_ma = ob_from.ma;
@@ -707,7 +858,7 @@ struct SolvingContext {
       }
     }
       
-    if (callSolver(model_idx,clock_SOLVER_EXTEND,true,induct)) {
+    if (callSolver(model_idx,clock_SOLVER_EXTEND,true,injection)) {
       
       MarkingSolver &model_solver = *solvers[model_idx];
       
@@ -715,10 +866,10 @@ struct SolvingContext {
         if (ob_from.from_clause) { // a may obligation
           LOG(printf("Reaching states found\n");)
         
+          // TODO: this makes now sense right now:
           if (model_idx)
             oblig_hit_reaching++;
         
-          // if there is a clause, it is now bad
           CWBox* req_box = ob_from.from_clause;
           
           // if there is a clause, it is now bad
@@ -727,7 +878,7 @@ struct SolvingContext {
             cl_box->other = 0;
             req_box->other = 0;
             
-            clauses_found_bad++;
+            clauses_discovered_bad++;
           } else {
             assert(req_box->other == 0);
           }
@@ -740,20 +891,22 @@ struct SolvingContext {
             vec<Lit>& our_ma = ob.ma;
           
             // 1) the state is becoming reaching
-            /*
-            reaching_states.push();
-            vec<Lit>& state = reaching_states.last();
+            state_tmp.clear();
             
             for (int i = 0; i < our_ma.size(); i++) {
               assert(var(our_ma[i]) >= sigsize);
-              if (var(our_ma[i]) < 2*sigsize) { // staying up, but negated -> in a state form
-                state.push(mkLit(var(our_ma[i]),!sign(our_ma[i])));
+              if (var(our_ma[i]) < 2*sigsize) {
+                Lit l = our_ma[i];
+                l = mkLit(var(l)-sigsize,!sign(l)); // move down, turn into a variable in the range 0..2*sigsize-1 (dual rail); negating the sign, to get a state form
+                state_tmp.push(mkLit(toInt(l)));   // states are only positive
               }
               // ignoring the step marker
             }
-            */
+            reaching_states.addClause(state_tmp);
+        
+            LOG(printf("At %d: ",idx); printLits(our_ma);)
             
-            LOG(printf("At %d: ",idx); printLits(state);)
+            LOG2(printLits(state_tmp);)
             
             // 2) no longer alive
             ob.alive = false;
@@ -761,11 +914,12 @@ struct SolvingContext {
             idx++;
           }
           
-          // TODO: insert new reaching states into something ...
+          // TODO: later try storing one extra (potentially) reaching state in the req_box (the one on the left hand side when may-chain started)
+          // but only for the next version
           
           // req_box dies
-          assert(!req_box->prev);
-          // req_box->disintegrate(); // should have been disintegrated when this may-chain started
+          assert(!req_box->prev); // should have been disintegrated when this may-chain started
+          // req_box->disintegrate();
           delete req_box;
           
           return true;
@@ -823,11 +977,9 @@ struct SolvingContext {
         
         bool solved;
         
-        if (!extend(top-1,obligations[top],obligations[top-1],true,solved)) { // new concflict clause derived
+        if (!extend(top-1,obligations[top],obligations[top-1],false /* not an injection */,solved)) { // new concflict clause derived
           oblig_unsat++;
-          clauses_dersolver++; // TODO: do we need both?
-          
-          // TODO: make sure you prune obligations all the way it's necessary!
+          clauses_dersolver++;
           
           // convert the conflict to the upper signature and possibly remove the step marker
           int i,j;      
@@ -841,8 +993,7 @@ struct SolvingContext {
               conflict_out[j++] = lit;
             }
           }
-          conflict_out.shrink(i-j);          
-          // TODO: conflict_out.push(goal_lit);  // doing it the monotone way!
+          conflict_out.shrink(i-j);
           sort(conflict_out);  // sort for fast subsumption checks                         
           
           ABSTRACTION_TYPE abs = calcAbstraction(conflict_out);
@@ -899,7 +1050,7 @@ struct SolvingContext {
       
         bool solved;
       
-        if (!extend(phase,initial_obligation,obligations[top],false /* induction is not correct for the initial call */,solved)) {
+        if (!extend(phase,initial_obligation,obligations[top],true /* we are an injection; don't weaken or inductively minimize */,solved)) {
         
           LOG(printf("failed injection -- end of phase\n");)
         
@@ -934,7 +1085,7 @@ struct SolvingContext {
         continue;
       }
       
-      if (push_requests[top]) { // do some pushing -- TODO: later try optimizing the order in which clauses are pushed!
+      if (push_requests[top]) { // do some pushing -- TODO: later try optimizing the order in which clauses are pushed (i.e. FIFO/LIFO etc)
         LOG(printf("processObligations - pushing\n");)
         
         CWBox* req_box = push_requests[top];
@@ -947,6 +1098,41 @@ struct SolvingContext {
         }
         
         vec<Lit> & clause = cl_box->data;
+        
+        { // immediately bad ?
+          leave_out.clear();
+          leave_out.growTo(2*sigsize,false);
+          
+          for (int i = 0; i < clause.size(); i++) {
+            assert(var(clause[i]) >= sigsize);
+            assert(var(clause[i]) < 2*sigsize);
+            
+            Lit l = mkLit(var(clause[i])-sigsize,sign(clause[i]));
+            
+            LOG2(printf("Leaveout "); printLit(l); printf("\n");)
+            
+            leave_out[toInt(l)] = true;
+          }
+          
+          reach_probe.clear();
+          for (int j = 0; j < 2*sigsize; j++)
+            if (bridge_variables[var(toLit(j))] && !leave_out[j])
+              reach_probe.push(mkLit(j,true));
+          
+          // reaching_states.setConfBudget(0); // TODO: make sure this works
+          if (reaching_states.solveLimited(reach_probe) == l_False) {
+            clauses_immediately_bad++;
+            LOG2(printf("Immeately bad.\n");)
+          
+            // the clause is bad now
+            cl_box->other = 0;
+            req_box->disintegrate();
+            delete req_box; // by now there is no alive may obligation pointing to this req_box!
+
+            continue;
+          }
+        }
+        
         solver_call_push++;
         pushing_request++;
               
@@ -957,34 +1143,28 @@ struct SolvingContext {
         }
         filtered_ma.push(mkLit(2*sigsize, false));
 
-        if (callSolver(top,clock_SOLVER_PUSH,false,false)) {
+        if (callSolver(top,clock_SOLVER_PUSH,false,true)) {
           // TODO: Could this be made inductive and merged with other extensions? (kind of a push request injection, right?)
           // Are we afraid of partial models? We know how to do ternary (though only in rev, without pg and without simp) which uses partial all the time!
           
-          oblig_may_injected++;
-          
           MarkingSolver &model_solver = *solvers[top];
           
-          // TODO: jumped into a reaching state handling ...
           
-          // especially when pushing from layer 0, instead of may obligation we need to make them bad immediately!
+          if (top == 0) { // jumped into the goal instead of injecting; new reachable found, clause is bad
+            clauses_discovered_bad++;
+            
+            LOG(printf("Pushing failed for a layer[0] clause -- clause is bad\n");)
           
-          /*if (model_solver.value(goal_lit) == l_True) {
-            clauses_found_bad++;
-          
-            LOG(printf("Pushing failed, jumped to reachable at %d -- clause is bad\n",top);)
-          
-            // hit a goal-reaching state in layer[top] while it's predecessor satisfies non C => C is bad, never push again!
             cl_box->other = 0;
             req_box->disintegrate();
             delete req_box;
             
-            // TODO: here we could also try extracting the reaching state from the predecessor, but let's say we will systematically not do it (for now)
-            // (we never extract states from the lower signature)
+            // TODO: here we could also try extracting the reaching state from the predecessor
             
-          } else */{
-          
+          } else {
             LOG(printf("Pushing failed, may obligation injected to %d\n",top);)
+            
+            oblig_may_injected++;
           
             Oblig& ob = obligations[top];
             ob.alive = true;
@@ -1003,9 +1183,11 @@ struct SolvingContext {
                 ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and negated ("as a clause")
             }
             // only after the previous, so that it is sorted
-            ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses
+            ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses req_box
             
             ob.abs = calcAbstraction(ma);
+            
+            // TODO: here we could also try extracting a potentailly reaching state from the predecessor (and store it inside )
             
             // push_request stays in push_requests[top]; ob will be the thing to work on next, in the next iteration
           }
@@ -1087,9 +1269,14 @@ struct SolvingContext {
         // make the goal dnf the first reaching state
         state_tmp.clear();
         
+        LOG2(printf("Adding the goal state: \n");)
+        
         // and insert it into layer 0 as a bunch of clauses
         for (int i = 0; i < goal_clauses.size(); i++) {
           vec<Lit> & goal_clause = goal_clauses[i];
+          
+          LOG2(printf("Goal clause after elim: "); printLits(goal_clause);)
+          
           assert(goal_clause.size() <= 1);
           
           CWBox *clbox = new CWBox(calcAbstraction(goal_clause),goal_clause);
@@ -1107,7 +1294,12 @@ struct SolvingContext {
           if (goal_clause.size()) { // ingore the degenerate case with an empty goal clause
             Lit l = goal_clause[0];
             assert(var(l)>= sigsize);
+            assert(var(l)<2*sigsize);
+            
             l = mkLit(var(l)-sigsize,sign(l)); // move down, turn into a variable in the range 0..2*sigsize-1 (dual rail)
+            
+            // LOG2(printf("Goal lit: "); printLit(l); printf("\n");)
+            
             state_tmp.push(mkLit(toInt(l)));   // states are only positive
           }
         }
@@ -1287,9 +1479,12 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
   simpSolver.setFrozen(2*sigsize+1,true);
   // all the goal lit's need to be frozen! TODO: so we don't need to put the goal clauses in there at all? Do we need the goal marker at all? Simplify!
   for (int j = 0; j < goal.size(); j++) {
+  
+    // LOG2(printf("Goal clause before elim: "); printLits(goal[j]);)
+    
     assert(goal[j].size() <= 1);
     if (goal[j].size()) {
-      simpSolver.setFrozen(var(goal[j][0]),true);
+      simpSolver.setFrozen(var(goal[j][0])+sigsize,true);
     }
   }
   
