@@ -516,8 +516,10 @@ struct SolvingContext {
   bool callSolver(int index, CLOCK_CLOCKS cc,       // calls the index-th solver, under then give assumptions filtered_ma plus the layer assumptions
                   bool compute_conflict,          // request for returning (minimized, if flag set) appropriate conflict clause (to be delivered in conflict_out), 
                                                   // also, target_layer_out will containt index of the least delta layer on which the conflict depends (or inductive_layer_idx for "infty")
-                  bool injection) {
+                  bool injection,
+                  bool& started_from_reaching) { // only when not injecting; it can happen that we realize we started from a reaching state already
                                                            
+    started_from_reaching = false;
 
     MarkingSolver& solver = *solvers[index];
 
@@ -605,10 +607,11 @@ struct SolvingContext {
           }
           
           if (slack == lit_Undef) {
-          
-            printf("Hitting a reaching state by accident!\n");
-          
-            assert(false);
+            started_from_reaching = true;
+            
+            printf("Hitting a reaching state by accident\n");
+            
+            return result;
             
             // error - we set off from a reachable state! report as a special return value!!!
           } else {
@@ -864,16 +867,17 @@ struct SolvingContext {
         filtered_ma.push(our_ma[i]);      // this is the initial / step marker
       }
     }
-      
-    if (callSolver(model_idx,clock_SOLVER_EXTEND,true,injection)) {
+    
+    bool started_from_reaching;
+    
+    if (callSolver(model_idx,clock_SOLVER_EXTEND,true,injection,started_from_reaching) || started_from_reaching) {
       
       MarkingSolver &model_solver = *solvers[model_idx];
       
-      if (model_idx == 0 /*|| model_solver.value(goal_lit) == l_True  TODO: reaching detection*/ ) {
+      if (model_idx == 0 || started_from_reaching ) {
         if (ob_from.from_clause) { // a may obligation
           LOG(printf("Reaching states found\n");)
         
-          // TODO: this makes now sense right now:
           if (model_idx)
             oblig_hit_reaching++;
         
@@ -898,22 +902,24 @@ struct SolvingContext {
             vec<Lit>& our_ma = ob.ma;
           
             // 1) the state is becoming reaching
-            state_tmp.clear();
+            if (started_from_reaching && idx == model_idx+1) { // unless it already was
+              state_tmp.clear();
             
-            for (int i = 0; i < our_ma.size(); i++) {
-              assert(var(our_ma[i]) >= sigsize);
-              if (var(our_ma[i]) < 2*sigsize) {
-                Lit l = our_ma[i];
-                l = mkLit(var(l)-sigsize,!sign(l)); // move down, turn into a variable in the range 0..2*sigsize-1 (dual rail); negating the sign, to get a state form
-                state_tmp.push(mkLit(toInt(l)));   // states are only positive
+              for (int i = 0; i < our_ma.size(); i++) {
+                assert(var(our_ma[i]) >= sigsize);
+                if (var(our_ma[i]) < 2*sigsize) {
+                  Lit l = our_ma[i];
+                  l = mkLit(var(l)-sigsize,!sign(l)); // move down, turn into a variable in the range 0..2*sigsize-1 (dual rail); negating the sign, to get a state form
+                  state_tmp.push(mkLit(toInt(l)));   // states are only positive
+                }
+                // ignoring the step marker
               }
-              // ignoring the step marker
-            }
-            reaching_states.addClause(state_tmp);
+              reaching_states.addClause(state_tmp);
         
-            LOG(printf("At %d: ",idx); printLits(our_ma);)
-            
-            LOG2(printLits(state_tmp);)
+              LOG(printf("At %d: ",idx); printLits(our_ma);)
+              
+              LOG2(printLits(state_tmp);)
+            }
             
             // 2) no longer alive
             ob.alive = false;
@@ -1150,7 +1156,8 @@ struct SolvingContext {
         }
         filtered_ma.push(mkLit(2*sigsize, false));
 
-        if (callSolver(top,clock_SOLVER_PUSH,false,true)) {
+        bool dummy;
+        if (callSolver(top,clock_SOLVER_PUSH,false /*no conflict*/,true /*yes, injection*/,dummy)) {
           // TODO: Could this be made inductive and merged with other extensions? (kind of a push request injection, right?)
           // Are we afraid of partial models? We know how to do ternary (though only in rev, without pg and without simp) which uses partial all the time!
           
