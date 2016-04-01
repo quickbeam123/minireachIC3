@@ -902,7 +902,7 @@ struct SolvingContext {
             vec<Lit>& our_ma = ob.ma;
           
             // 1) the state is becoming reaching
-            if (started_from_reaching && idx == model_idx+1) { // unless it already was
+            if (!started_from_reaching || idx != model_idx+1) { // unless it already was
               state_tmp.clear();
             
               for (int i = 0; i < our_ma.size(); i++) {
