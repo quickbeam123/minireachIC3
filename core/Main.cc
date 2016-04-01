@@ -605,8 +605,11 @@ struct SolvingContext {
           }
           
           if (slack == lit_Undef) {
-            assert(false);
           
+            printf("Hitting a reaching state by accident!\n");
+          
+            assert(false);
+            
             // error - we set off from a reachable state! report as a special return value!!!
           } else {
             assert(!sign(slack));
