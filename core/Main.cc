@@ -52,7 +52,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 
 #define LOG(X)
 
-#define LOG2(X) 
+#define LOG2(X)
 
 using namespace Minisat;
 
@@ -529,8 +529,6 @@ struct SolvingContext {
     minimark_in.clear();
     for (int i = index; i <= phase; i++)
       minimark_in.push(i);
-    
-    // TODO: don't need to add these for injections -- anyway, the code for injections should be different, I guess...
     minimark_in.push(inductive_layer_idx);
     minimark_in.push(assumption_mark_id);
     
@@ -542,11 +540,13 @@ struct SolvingContext {
     if (!result && compute_conflict) {
       solver.preprocessConflict(conflict_out,minimark_out);
       
-      if (!injection) { // we used to minimize even the injection call, but let's not do it ...
+      int last_added_back = -1;
+      Var weakening_marker = -1;
+      
+      if (!injection) { // we used to minimize even the injection call, but now it does not make sense with this code:
         LOG2(printf("Solver produced clause "); printLits(conflict_out);)
       
-        int last_added_back = -1;
-        Var weakening_marker = reaching_states.newVar();
+        weakening_marker = reaching_states.newVar();
         
         // weaken wrt reaching_states
         
@@ -624,145 +624,147 @@ struct SolvingContext {
           }
           // and repeat to see if we are happy yet
         }
+      }
         
-        if (opt_minimize) {
-          LOG2(printf("Going to minimize (last_added_back = %d)\n",last_added_back);)
-        
-          unremovable.clear();
-          unremovable.growTo(sigsize,false);
-          if (last_added_back != -1)
-            unremovable[last_added_back] = true;
-        
-          minim_attempts++;
-        
-          minim_solver += filtered_ma.size() - conflict_out.size();
-                                   
-          //turn the conflict clause back to assumptions
-          for (int i = 0; i < conflict_out.size(); i++) {
-            conflict_out[i] = ~conflict_out[i];
-            
-            LOG2(printLit(conflict_out[i]);)
-          }
-          solver.preprocessAssumptions(conflict_out,minimark_in);
-          Lit indy = solver.getAssump(conflict_out.size() + minimark_in.size() - 2); // the translation of the induction marker, which we never plan to remove
-          int assy_idx = conflict_out.size() + minimark_in.size() - 1;
-          Lit assy = solver.getAssump(assy_idx); // the translation of the assumption marker, which we never plan to remove
-          int size = conflict_out.size();
-                        
-          //generate random permutation
-          ramdomizePerm(size);
-                  
-          bool removed_something;
-          int cycle_count = 0;
-          do {                 
-            removed_something = false;
-            
-            // one pass:
-            for (int i = 0; i < size; i++) {
-              int idx = rnd_perm[i];
-            
-              Lit save = solver.getAssump(idx);
-              if (save == indy) // already removed in previous passes
-                continue;
-
-              if (var(save) >= sigsize) {
-                assert(var(save) == 2*sigsize); // the step marker
-                continue;
-              }
-             
-              if (unremovable[var(save)])  // we tried with this one already, or we needed to added it before to make the clause implied by reaching
-                continue;
-
-              // can we remove this literal from clause?
-              reach_probe.shrink(reach_probe.size()-1); // reset just to the state forcing marker
-              for (int i = 0; i < sigsize; i++) {
-                if (bridge_variables[i] && (!the_clause[i] || i == var(save))) {
-                  reach_probe.push(mkLit(toInt(mkLit(i,!the_state[i])),true));
-                }
-              }
-              // reaching_states.setConfBudget(0);   // TODO: check that this works
-              if (reaching_states.solveLimited(reach_probe) == l_False) {
-              
-                LOG2(printLit(save); printf(" cannot be dropped from a clause.\n");)
+      if (!injection && opt_minimize) { // even injections need to get target_layer_out set! (see the else branch)
+        LOG2(printf("Going to minimize (last_added_back = %d)\n",last_added_back);)
+      
+        unremovable.clear();
+        unremovable.growTo(sigsize,false);
+        if (last_added_back != -1)
+          unremovable[last_added_back] = true;
+      
+        minim_attempts++;
+      
+        minim_solver += filtered_ma.size() - conflict_out.size();
+                                 
+        //turn the conflict clause back to assumptions
+        for (int i = 0; i < conflict_out.size(); i++) {
+          conflict_out[i] = ~conflict_out[i];
+          
+          LOG2(printLit(conflict_out[i]);)
+        }
+        solver.preprocessAssumptions(conflict_out,minimark_in);
+        Lit indy = solver.getAssump(conflict_out.size() + minimark_in.size() - 2); // the translation of the induction marker, which we never plan to remove
+        int assy_idx = conflict_out.size() + minimark_in.size() - 1;
+        Lit assy = solver.getAssump(assy_idx); // the translation of the assumption marker, which we never plan to remove
+        int size = conflict_out.size();
+                      
+        //generate random permutation
+        ramdomizePerm(size);
                 
-                unremovable[var(save)] = true;
-                continue;
-              }
-              
-              LOG2(printf("Will try removing %d\n",var(save));)
+        bool removed_something;
+        int cycle_count = 0;
+        do {                 
+          removed_something = false;
+          
+          // one pass:
+          for (int i = 0; i < size; i++) {
+            int idx = rnd_perm[i];
+          
+            Lit save = solver.getAssump(idx);
+            if (save == indy) // already removed in previous passes
+              continue;
 
-              solver.setAssump(idx,indy);  // one assumption effectively removed (since replaced by indy)
-              
-              if (opt_induction) {  // inductively assume the current conflict clause
-                //abusing conflict_out for that
-                conflict_out.clear();
-                for (int i = 0; i < size; i++) {
-                  Lit l = solver.getAssump(i);
-                  if (l != indy && var(l) < sigsize)
-                    conflict_out.push(mkLit(var(l)+sigsize,!sign(l)));   // negate back and shift
-                }
-                
-                // here we used to be adding the goal lit, to make the clause monotone
-                
-                marks_tmp.clear();
-                marks_tmp.push(assumption_mark_id); 
-                solver.addClause(conflict_out,marks_tmp);
-              }
-            
-              if (solver.simplify(),solver.solve()) {
-                solver.setAssump(idx,save);  // put the literal back
+            if (var(save) >= sigsize) {
+              assert(var(save) == 2*sigsize); // the step marker
+              continue;
+            }
+           
+            if (unremovable[var(save)])  // we tried with this one already, or we needed to added it before to make the clause implied by reaching
+              continue;
 
-                LOG2(printf("Putting back\n");)
-
-                if (opt_induction) {
-                  solver.invalidateMarker(assumption_mark_id); // efectively delete the assumed clause                
-                  assy = mkLit(solver.ensureMarkerRegistered(assumption_mark_id),true); // immediately claim it again (the same id, but a new var!) and make a lit out of it
-                  solver.setAssump(assy_idx,assy);  // assume the new guy from now on
-                }
-                
-              } else {              
-                minim_explicit++;
-                removed_something = true;
-
-                LOG2(printf("Removed\n");)
-                
-                // remove from the_clause
-                the_clause[var(save)] = false;
+            // can we remove this literal from clause?
+            reach_probe.shrink(reach_probe.size()-1); // reset just to the state forcing marker
+            for (int i = 0; i < sigsize; i++) {
+              if (bridge_variables[i] && (!the_clause[i] || i == var(save))) {
+                reach_probe.push(mkLit(toInt(mkLit(i,!the_state[i])),true));
               }
             }
-            cycle_count++;
-          } while ((opt_induction>1) && removed_something);
-          
-          // "pushing"         
-          target_layer_out = index;        
-          for (int i = 0; i < minimark_in.size()-2; i++) {
-            solver.setAssump(size + i, indy);
-            if (solver.simplify(),solver.solve())
-              break; // TODO: this is where we could already take a good witness (would save one call)
+            // reaching_states.setConfBudget(0);   // TODO: check that this works
+            if (reaching_states.solveLimited(reach_probe) == l_False) {
             
-            target_layer_out = minimark_in[i+1]; //makes sense even with inductive_layer_idx, which is the last but one value       
-            minim_push++;
-          }       
-                       
-          // prepare final version of conflict_out        
-          conflict_out.clear();
-          for (int i = 0; i < size; i++) {
-            Lit l = solver.getAssump(i);
-            if (l != indy)
-              conflict_out.push(~l);     // negate back 
-          }                          
-          
-          // cleanup
-          if (opt_induction)
-            solver.invalidateMarker(assumption_mark_id);
+              LOG2(printLit(save); printf(" cannot be dropped from a clause.\n");)
+              
+              unremovable[var(save)] = true;
+              continue;
+            }
             
-        } else {
-          target_layer_out = inductive_layer_idx;                           
-          for (int i = 0; i < minimark_out.size(); i++)
-            if (minimark_out[i] < target_layer_out) // relying on (inductive_layer_idx < assumption_mark_id)
-              target_layer_out = minimark_out[i];      
-        }
+            LOG2(printf("Will try removing %d\n",var(save));)
+
+            solver.setAssump(idx,indy);  // one assumption effectively removed (since replaced by indy)
+            
+            if (opt_induction) {  // inductively assume the current conflict clause
+              //abusing conflict_out for that
+              conflict_out.clear();
+              for (int i = 0; i < size; i++) {
+                Lit l = solver.getAssump(i);
+                if (l != indy && var(l) < sigsize)
+                  conflict_out.push(mkLit(var(l)+sigsize,!sign(l)));   // negate back and shift
+              }
+              
+              // here we used to be adding the goal lit, to make the clause monotone
+              
+              marks_tmp.clear();
+              marks_tmp.push(assumption_mark_id); 
+              solver.addClause(conflict_out,marks_tmp);
+            }
+          
+            if (solver.simplify(),solver.solve()) {
+              solver.setAssump(idx,save);  // put the literal back
+
+              LOG2(printf("Putting back\n");)
+
+              if (opt_induction) {
+                solver.invalidateMarker(assumption_mark_id); // efectively delete the assumed clause                
+                assy = mkLit(solver.ensureMarkerRegistered(assumption_mark_id),true); // immediately claim it again (the same id, but a new var!) and make a lit out of it
+                solver.setAssump(assy_idx,assy);  // assume the new guy from now on
+              }
+              
+            } else {              
+              minim_explicit++;
+              removed_something = true;
+
+              LOG2(printf("Removed\n");)
+              
+              // remove from the_clause
+              the_clause[var(save)] = false;
+            }
+          }
+          cycle_count++;
+        } while ((opt_induction>1) && removed_something);
         
+        // "pushing"         
+        target_layer_out = index;        
+        for (int i = 0; i < minimark_in.size()-2; i++) {
+          solver.setAssump(size + i, indy);
+          if (solver.simplify(),solver.solve())
+            break; // TODO: this is where we could already take a good witness (would save one call)
+          
+          target_layer_out = minimark_in[i+1]; //makes sense even with inductive_layer_idx, which is the last but one value       
+          minim_push++;
+        }       
+                     
+        // prepare final version of conflict_out        
+        conflict_out.clear();
+        for (int i = 0; i < size; i++) {
+          Lit l = solver.getAssump(i);
+          if (l != indy)
+            conflict_out.push(~l);     // negate back 
+        }                          
+        
+        // cleanup
+        if (opt_induction)
+          solver.invalidateMarker(assumption_mark_id);
+          
+      } else {
+        target_layer_out = inductive_layer_idx;                           
+        for (int i = 0; i < minimark_out.size(); i++)
+          if (minimark_out[i] < target_layer_out) // relying on (inductive_layer_idx < assumption_mark_id)
+            target_layer_out = minimark_out[i];      
+      }
+      
+      if (!injection) {
         reaching_states.releaseVar(mkLit(weakening_marker));
       }
     }
@@ -821,10 +823,12 @@ struct SolvingContext {
       } else {
         clauses_subsumed += res;
 
-        Oblig& ob = obligations[i];
-        if (ob.alive && absSubsumes(abs,ob.abs) && subsumes(clause,ob.ma)) {
-          ob.alive = false;
-          oblig_subsumed ++;
+        if (i <= phase) {
+          Oblig& ob = obligations[i];
+          if (ob.alive && absSubsumes(abs,ob.abs) && subsumes(clause,ob.ma)) {
+            ob.alive = false;
+            oblig_subsumed ++;
+          }
         }
       }
                  
