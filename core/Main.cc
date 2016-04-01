@@ -590,7 +590,7 @@ struct SolvingContext {
 
           Lit slack = lit_Undef;
           reaching_states.simplify();         // recycle released markers
-          // reaching_states.setConfBudget(1);   // TODO: check that this works
+          reaching_states.setConfBudget(1);   // TODO: check that this works
           if (reaching_states.solveLimited(reach_probe) == l_True) { // everything is all right
             LOG2(printf("Clause found weak enough.\n");)
             break;
@@ -681,7 +681,7 @@ struct SolvingContext {
                 reach_probe.push(mkLit(toInt(mkLit(i,!the_state[i])),true));
               }
             }
-            // reaching_states.setConfBudget(0);   // TODO: check that this works
+            reaching_states.setConfBudget(1);   // TODO: check that this works
             if (reaching_states.solveLimited(reach_probe) == l_False) {
             
               LOG2(printLit(save); printf(" cannot be dropped from a clause.\n");)
@@ -1123,7 +1123,7 @@ struct SolvingContext {
             if (bridge_variables[var(toLit(j))] && !leave_out[j])
               reach_probe.push(mkLit(j,true));
           
-          // reaching_states.setConfBudget(0); // TODO: make sure this works
+          reaching_states.setConfBudget(1); // TODO: make sure this works
           if (reaching_states.solveLimited(reach_probe) == l_False) {
             clauses_immediately_bad++;
             LOG2(printf("Immeately bad.\n");)
