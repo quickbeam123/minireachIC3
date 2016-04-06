@@ -157,7 +157,7 @@ void Solver::releaseVar(Lit l)
 }
 
 
-bool Solver::addClause_(vec<Lit>& ps)
+bool Solver::addClause_(vec<Lit>& ps, bool toLearnts)
 {
     assert(decisionLevel() == 0);
     if (!ok) return false;
@@ -178,8 +178,11 @@ bool Solver::addClause_(vec<Lit>& ps)
         uncheckedEnqueue(ps[0]);
         return ok = (propagate() == CRef_Undef);
     }else{
-        CRef cr = ca.alloc(ps, false);
-        clauses.push(cr);
+        CRef cr = ca.alloc(ps, toLearnts);
+        if (toLearnts)
+          learnts.push(cr);
+        else
+          clauses.push(cr);
         attachClause(cr);
     }
 

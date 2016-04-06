@@ -329,6 +329,7 @@ struct SolvingContext {
     if (opt_statreaching) {
       printf("\nReaching states:\n");
       printf("\t%d found,\n",reaching_total - reaching_found);
+      printf("\t%d internally,\n",reaching_states.nLearnts());
       printf("\t%d in total.\n",reaching_total);
       
       reaching_found = reaching_total;
@@ -596,7 +597,7 @@ struct SolvingContext {
           if (slack == lit_Undef) {
             started_from_reaching = true;
             
-            printf("Hitting a reaching state by accident\n");
+            // printf("Hitting a reaching state by accident\n");
             
             return result;
             
@@ -903,7 +904,8 @@ struct SolvingContext {
                 }
                 // ignoring the step marker
               }
-              reaching_states.addClause(state_tmp);
+              
+              reaching_states.addClause(state_tmp,true /* adding to learnts */);
         
               LOG(printf("At %d: ",idx); printLits(our_ma);)
               
@@ -1235,12 +1237,15 @@ struct SolvingContext {
     return false;
   }
    
-  void iterativeSearch() {
+  void iterativeSearch(int magic_number) {
     assert(initial_obligation.ma.size() == 0);
     assert(initial_obligation.from_clause == 0); // injector is a must obligation
     initial_obligation.ma.push(mkLit(2*sigsize,  true)); // not (L_initial)
     
     layers.push();      // for the inducive layer
+
+    // at least as many reaching states as there was clauses in simpSolver
+    reaching_states.min_learnts_lim = magic_number;
 
     // initialize the signature
     for (int i = 0; i < 2*sigsize; i++)
@@ -1592,7 +1597,7 @@ static void analyzeSpec(int sigsize, Clauses &initial, Clauses &goal, Clauses &u
   
   clock_StopPassedTime(clock_SIMP);
   
-  context.iterativeSearch();    
+  context.iterativeSearch(simpSolver.nClauses());
   
   /*
   Clauses& model_path = context.model_path;
