@@ -505,6 +505,10 @@ void Solver::analyzeFinal(Lit p, LSet& out_conflict)
                 out_conflict.insert(~trail[i]);
             }else{
                 Clause& c = ca[reason(x)];
+              
+                if (c.learnt())
+                  claBumpActivity(c);
+              
                 for (int j = 1; j < c.size(); j++)
                     if (level(var(c[j])) > 0)
                         seen[var(c[j])] = 1;
