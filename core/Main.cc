@@ -133,11 +133,9 @@ ABSTRACTION_TYPE calcAbstraction(vec<Lit> const & data) {
 
 //=================================================================================================
 
-static int ids = 0;
-
 /* wrapper for layer clauses and their witness */
 struct CWBox {
-  int id;
+  bool spawning;
 
   vec<Lit> data;         // for clause the actual literals, for witness the negated state as a clause
   ABSTRACTION_TYPE abs;  // abstraction of the above
@@ -147,8 +145,8 @@ struct CWBox {
   CWBox*  next;    // to form a linked list  
   CWBox** prev;    // to delete from anywhere
   
-  CWBox() : abs(0), other(0), next(0), prev(0) { id = ids ++; }
-  CWBox(ABSTRACTION_TYPE a, vec<Lit> const & d) : abs(a), other(0), next(0), prev(0) { d.copyTo(data); id = ids ++; } 
+  CWBox() : abs(0), other(0), next(0), prev(0) {}
+  CWBox(ABSTRACTION_TYPE a, vec<Lit> const & d) : abs(a), other(0), next(0), prev(0) { d.copyTo(data); }
     
   void integrate(CWBox** holder) {  // like insert
     assert(holder);
@@ -195,18 +193,6 @@ struct Oblig {
   Oblig() : alive(false), from_clause(0) {}
 };
 
-void printCWBox(CWBox* box) {
-  while (box) {
-    if (box->next) {
-      assert(box->next->prev == &box->next);    
-    }    
-    printf("%d -> ",box->id);
-    
-    box = box->next;
-  }
-  
-  printf("\n");
-}
 
 // a wrapper for vec< CWBox* > that repairs prev pointers in all the members if reallocation happens
 struct CBoxVec {
@@ -261,6 +247,7 @@ struct SolvingContext {
   int oblig_hit_reaching;
   int oblig_unsat;
   
+  int reaching_total;
   int reaching_found;
   
   int clauses_dersolver;
@@ -341,10 +328,10 @@ struct SolvingContext {
   
     if (opt_statreaching) {
       printf("\nReaching states:\n");
-      printf("\t%d found,\n",reaching_states.nClauses() - reaching_found);
-      printf("\t%d in total.\n",reaching_states.nClauses());
+      printf("\t%d found,\n",reaching_total - reaching_found);
+      printf("\t%d in total.\n",reaching_total);
       
-      reaching_found = reaching_states.nClauses();
+      reaching_found = reaching_total;
     }
   
     if (opt_statclauses) {
@@ -903,6 +890,8 @@ struct SolvingContext {
           
             // 1) the state is becoming reaching
             if (!started_from_reaching || idx != model_idx+1) { // unless it already was
+              reaching_total++;
+            
               state_tmp.clear();
             
               for (int i = 0; i < our_ma.size(); i++) {
@@ -1040,6 +1029,7 @@ struct SolvingContext {
   
             CWBox *prbox = new CWBox();
             prbox->integrate(&push_requests[target_layer_out+1]);
+            prbox->spawning = true;
             
             clbox->other = prbox;
             prbox->other = clbox;            
@@ -1176,34 +1166,38 @@ struct SolvingContext {
             // TODO: here we could also try extracting the reaching state from the predecessor
             
           } else {
-            LOG(printf("Pushing failed, may obligation injected to %d\n",top);)
-            
-            oblig_may_injected++;
-          
-            Oblig& ob = obligations[top];
-            ob.alive = true;
-            ob.from_clause = req_box; // starting a new may-chain
-            
             req_box->disintegrate(); // this means we only inject once (per phase)
             req_box->prev = 0; // unintegrated !
+          
+            if (req_box->spawning) {
+              LOG(printf("Pushing failed, may obligation injected to %d\n",top);)
             
-            // extract the witness
-            vec<Lit> & ma = ob.ma;
-            ma.clear();
+              oblig_may_injected++;
+          
+              Oblig& ob = obligations[top];
+              ob.alive = true;
+              ob.from_clause = req_box; // starting a new may-chain
+            
+              // extract the witness
+              vec<Lit> & ma = ob.ma;
+              ma.clear();
 
-            for (int j = 0; j < sigsize; j++) {
-              assert(model_solver.model[j+sigsize] != l_Undef);  
-              if (bridge_variables[j]) // does a reaching state need to be fully specified?
-                ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and negated ("as a clause")
+              for (int j = 0; j < sigsize; j++) {
+                assert(model_solver.model[j+sigsize] != l_Undef);
+                if (bridge_variables[j]) // does a reaching state need to be fully specified?
+                  ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and negated ("as a clause")
+              }
+              // only after the previous, so that it is sorted
+              ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses req_box
+            
+              ob.abs = calcAbstraction(ma);
+            
+              // TODO: here we could also try extracting a potentailly reaching state from the predecessor (and store it inside )
+            
+              // push_request stays in push_requests[top]; ob will be the thing to work on next, in the next iteration
+              
+              req_box->spawning = false;
             }
-            // only after the previous, so that it is sorted
-            ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses req_box
-            
-            ob.abs = calcAbstraction(ma);
-            
-            // TODO: here we could also try extracting a potentailly reaching state from the predecessor (and store it inside )
-            
-            // push_request stays in push_requests[top]; ob will be the thing to work on next, in the next iteration
           }
         } else {     // pushed
           marks_tmp.clear();
@@ -1299,6 +1293,7 @@ struct SolvingContext {
           // even the goal is potentially pushable (!) -- and binary generalizations (the invariant!) -- TODO!
           CWBox *prbox = new CWBox();
           prbox->integrate(&push_requests[0]);
+          prbox->spawning = false; // it does not make sense anyway
             
           clbox->other = prbox;
           prbox->other = clbox;
