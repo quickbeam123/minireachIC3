@@ -1179,7 +1179,21 @@ struct SolvingContext {
             req_box->disintegrate();
             delete req_box;
             
-            // TODO: here we could also try extracting the reaching state from the predecessor
+            // extract a reaching state from the predecessor
+            {
+              reaching_total++;
+              state_tmp.clear();
+              
+              for (int j = 0; j < sigsize; j++) {
+                assert(model_solver.model[j] != l_Undef);
+                if (bridge_variables[j]) {
+                  Lit l = mkLit(j,model_solver.model[j] == l_False);
+                  state_tmp.push(mkLit(toInt(l)));   // states are only positive
+                }
+              }
+              
+              reaching_states.addClause(state_tmp,true /* adding to learnts */);
+            }
             
           } else {
             req_box->disintegrate(); // this means we only inject once (per phase)
