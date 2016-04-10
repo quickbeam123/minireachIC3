@@ -179,10 +179,12 @@ bool Solver::addClause_(vec<Lit>& ps, bool toLearnts)
         return ok = (propagate() == CRef_Undef);
     }else{
         CRef cr = ca.alloc(ps, toLearnts);
-        if (toLearnts)
+        if (toLearnts) {
           learnts.push(cr);
-        else
+          claBumpActivity(ca[cr]);
+        } else {
           clauses.push(cr);
+        }
         attachClause(cr);
     }
 
