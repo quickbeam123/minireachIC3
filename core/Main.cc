@@ -918,8 +918,22 @@ struct SolvingContext {
             idx++;
           }
           
-          // TODO: later try storing one extra (potentially) reaching state in the req_box (the one on the left hand side when may-chain started)
-          // but only for the next version
+          // the "lhs"-state stored in req_box
+          {
+            vec<Lit> & stlhs = req_box->data;
+            assert(stlhs.size());
+            
+            reaching_total++;
+            state_tmp.clear();
+            
+            for (int i = 0; i < stlhs.size(); i++) {
+              assert(var(stlhs[i]) < sigsize);
+              // our_ma[i] already in the right form
+              state_tmp.push(mkLit(toInt(stlhs[i])));   // states are only positive
+            }
+              
+            reaching_states.addClause(state_tmp,true /* adding to learnts */);
+          }
           
           // req_box dies
           assert(!req_box->prev); // should have been disintegrated when this may-chain started
@@ -1181,21 +1195,33 @@ struct SolvingContext {
               ob.from_clause = req_box; // starting a new may-chain
             
               // extract the witness
-              vec<Lit> & ma = ob.ma;
-              ma.clear();
+              {
+                vec<Lit> & ma = ob.ma;
+                ma.clear();
 
-              for (int j = 0; j < sigsize; j++) {
-                assert(model_solver.model[j+sigsize] != l_Undef);
-                if (bridge_variables[j]) // does a reaching state need to be fully specified?
-                  ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and negated ("as a clause")
+                for (int j = 0; j < sigsize; j++) {
+                  assert(model_solver.model[j+sigsize] != l_Undef);
+                  if (bridge_variables[j])
+                    ma.push(mkLit(j+sigsize,model_solver.model[j+sigsize] == l_True));  //but it stays in upper signature and negated ("as a clause")
+                }
+                // only after the previous, so that it is sorted
+                ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses req_box
+            
+                ob.abs = calcAbstraction(ma);
               }
-              // only after the previous, so that it is sorted
-              ma.push(mkLit(2*sigsize, false)); // L_initial assumed true => turning on step clauses, turning off initial clauses req_box
             
-              ob.abs = calcAbstraction(ma);
-            
-              // TODO: here we could also try extracting a potentailly reaching state from the predecessor (and store it inside )
-            
+              // extract a potentailly reaching state from the predecessor (and store it inside req_box)
+              {
+                vec<Lit> & ma = req_box->data;
+                ma.clear();
+                
+                for (int j = 0; j < sigsize; j++) {
+                  assert(model_solver.model[j] != l_Undef);
+                  if (bridge_variables[j])
+                    ma.push(mkLit(j,model_solver.model[j] == l_False));  // already in the state form
+                }
+              }
+              
               // push_request stays in push_requests[top]; ob will be the thing to work on next, in the next iteration
               
               req_box->spawning = false;
