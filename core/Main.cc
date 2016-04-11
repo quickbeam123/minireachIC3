@@ -254,7 +254,7 @@ struct SolvingContext {
   int clauses_univ;
   int clauses_subsumed;
   int clauses_discovered_bad;
-  int clauses_immediately_bad;
+  int clauses_caught_bad;
   
   int solver_call_extension;
   int solver_call_push;
@@ -268,7 +268,7 @@ struct SolvingContext {
                      pushing_request(0), pushing_success(0),
                      oblig_must_injected(0), oblig_may_injected(0), oblig_processed(0), oblig_subsumed(0), oblig_sat_may(0), oblig_sat_must(0), oblig_hit_reaching(0), oblig_unsat(0),
                      reaching_found(0),
-                     clauses_dersolver(0), clauses_univ(0), clauses_subsumed(0), clauses_discovered_bad(0), clauses_immediately_bad(0),
+                     clauses_dersolver(0), clauses_univ(0), clauses_subsumed(0), clauses_discovered_bad(0), clauses_caught_bad(0),
                      solver_call_extension(0), solver_call_push(0),                     
                      minim_attempts(0), minim_solver(0), minim_explicit(0), minim_push(0)
       {}
@@ -339,7 +339,7 @@ struct SolvingContext {
       printf("\nClauses:\n");
       printf("\t%d derived by solver (%d universals), subsumed %d.\n",clauses_dersolver,clauses_univ,clauses_subsumed);
       printf("\t%d discovered bad,\n",clauses_discovered_bad);
-      printf("\t%d immediately bad.\n",clauses_immediately_bad);
+      printf("\t%d caught bad.\n",clauses_caught_bad);
       
       int inlayers = 0;
       int length_max = 0;
@@ -363,7 +363,7 @@ struct SolvingContext {
       clauses_univ = 0;  
       clauses_subsumed = 0;
       clauses_discovered_bad = 0;
-      clauses_immediately_bad = 0;
+      clauses_caught_bad = 0;
     }       
     
     if (opt_minimize && opt_sminim) {
@@ -835,6 +835,45 @@ struct SolvingContext {
     //printf("Killed %d, went %d steps deep and subsumed %d obligations\n",sum_cl_killed,target_layer-stopped,sum_ob_pushed);    
   }
   
+  void handleNewReaching(vec<Lit>& our_ma, int abs) {
+    // clause made bad if subsuming the new state
+    for (int i = 0; i < layers.size(); i++ )
+      for (CWBox* layer_box = layers[i]; layer_box != 0; layer_box = layer_box->next)
+        if (layer_box->other)  // registered as unknown
+          if (absSubsumes(layer_box->abs,abs) && subsumes(layer_box->data,our_ma)) { // turning bad
+            clauses_caught_bad++;
+            
+            CWBox* req_box = layer_box->other;
+            layer_box->other = 0;
+            if (req_box->prev)
+              req_box->disintegrate();
+            delete req_box;
+          }
+  
+    // TODO: now go and remove the code currently preceeding the badness check
+    
+    // put in to reaching_states + statistics
+    reaching_total++;
+            
+    state_tmp.clear();
+            
+    for (int i = 0; i < our_ma.size(); i++) {
+      assert(var(our_ma[i]) >= sigsize);
+      if (var(our_ma[i]) < 2*sigsize) {
+        Lit l = our_ma[i];
+        l = mkLit(var(l)-sigsize,!sign(l)); // move down, turn into a variable in the range 0..2*sigsize-1 (dual rail); negating the sign, to get a state form
+        state_tmp.push(mkLit(toInt(l)));    // states are only positive
+      }
+      // ignoring the step marker
+    }
+    
+    reaching_states.addClause(state_tmp,true /* adding to learnts */);
+
+    LOG(printf("At %d: ",idx); printLits(our_ma);)
+    
+    LOG2(printLits(state_tmp);)
+  }
+  
   // the positive part of extending is shared for both injection and proper extension
   // the negative done differently by each caller, assuming call to the solver returned false
   bool extend(int model_idx, Oblig& ob_from, Oblig& ob_to, bool injection, bool& solved) {
@@ -890,27 +929,8 @@ struct SolvingContext {
             vec<Lit>& our_ma = ob.ma;
           
             // 1) the state is becoming reaching
-            if (!started_from_reaching || idx != model_idx+1) { // unless it already was
-              reaching_total++;
-            
-              state_tmp.clear();
-            
-              for (int i = 0; i < our_ma.size(); i++) {
-                assert(var(our_ma[i]) >= sigsize);
-                if (var(our_ma[i]) < 2*sigsize) {
-                  Lit l = our_ma[i];
-                  l = mkLit(var(l)-sigsize,!sign(l)); // move down, turn into a variable in the range 0..2*sigsize-1 (dual rail); negating the sign, to get a state form
-                  state_tmp.push(mkLit(toInt(l)));   // states are only positive
-                }
-                // ignoring the step marker
-              }
-              
-              reaching_states.addClause(state_tmp,true /* adding to learnts */);
-        
-              LOG(printf("At %d: ",idx); printLits(our_ma);)
-              
-              LOG2(printLits(state_tmp);)
-            }
+            if (!started_from_reaching || idx != model_idx+1) // unless it already was
+              handleNewReaching(ob.ma,ob.abs);
             
             // 2) no longer alive
             ob.alive = false;
@@ -1103,40 +1123,6 @@ struct SolvingContext {
         }
         
         vec<Lit> & clause = cl_box->data;
-        
-        { // immediately bad ?
-          leave_out.clear();
-          leave_out.growTo(2*sigsize,false);
-          
-          for (int i = 0; i < clause.size(); i++) {
-            assert(var(clause[i]) >= sigsize);
-            assert(var(clause[i]) < 2*sigsize);
-            
-            Lit l = mkLit(var(clause[i])-sigsize,sign(clause[i]));
-            
-            LOG2(printf("Leaveout "); printLit(l); printf("\n");)
-            
-            leave_out[toInt(l)] = true;
-          }
-          
-          reach_probe.clear();
-          for (int j = 0; j < 2*sigsize; j++)
-            if (bridge_variables[var(toLit(j))] && !leave_out[j])
-              reach_probe.push(mkLit(j,true));
-          
-          reaching_states.setConfBudget(1); // TODO: make sure this works
-          if (reaching_states.solveLimited(reach_probe) == l_False) {
-            clauses_immediately_bad++;
-            LOG2(printf("Immeately bad.\n");)
-          
-            // the clause is bad now
-            cl_box->other = 0;
-            req_box->disintegrate();
-            delete req_box; // by now there is no alive may obligation pointing to this req_box!
-
-            continue;
-          }
-        }
         
         solver_call_push++;
         pushing_request++;
