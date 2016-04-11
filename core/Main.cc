@@ -926,7 +926,6 @@ struct SolvingContext {
           while (idx <= phase /* actually, there should never be a may-obligation at index "phase", at least not as we currently do things */
                 && obligations[idx].from_clause == req_box) {
             Oblig& ob = obligations[idx];
-            vec<Lit>& our_ma = ob.ma;
           
             // 1) the state is becoming reaching
             if (!started_from_reaching || idx != model_idx+1) // unless it already was
