@@ -1577,6 +1577,70 @@ int main(int argc, char** argv)
               
     clock_StopPassedTime(clock_PARSE);
     
+    {
+      printf("i cnf %d %d\n",sigsize,initial.size());
+      for (int i = 0; i < initial.size(); i++) {
+        vec<Lit> const & cl = initial[i];
+        
+        for (int j = 0; j < cl.size(); j++) {
+          Lit l = cl[j];
+          int val = var(l)+1;
+          if (sign(l)) {
+            val = -val;
+          }
+          printf("%d ",val);
+        }
+        printf("0\n");
+      }
+      
+      printf("u cnf %d %d\n",sigsize,universal.size());
+      for (int i = 0; i < universal.size(); i++) {
+        vec<Lit> const & cl = universal[i];
+        
+        for (int j = 0; j < cl.size(); j++) {
+          Lit l = cl[j];
+          int val = var(l)+1;
+          if (sign(l)) {
+            val = -val;
+          }
+          printf("%d ",val);
+        }
+        printf("0\n");
+      }
+      
+      printf("g cnf %d %d\n",sigsize,goal.size());
+      for (int i = 0; i < goal.size(); i++) {
+        vec<Lit> const & cl = goal[i];
+        
+        for (int j = 0; j < cl.size(); j++) {
+          Lit l = cl[j];
+          int val = var(l)+1;
+          if (sign(l)) {
+            val = -val;
+          }
+          printf("%d ",val);
+        }
+        printf("0\n");
+      }
+      
+      printf("t cnf %d %d\n",2*sigsize,step.size());
+      for (int i = 0; i < step.size(); i++) {
+        vec<Lit> const & cl = step[i];
+        
+        for (int j = 0; j < cl.size(); j++) {
+          Lit l = cl[j];
+          int val = var(l)+1;
+          if (sign(l)) {
+            val = -val;
+          }
+          printf("%d ",val);
+        }
+        printf("0\n");
+      }    
+    
+      exit (0);
+    }
+      
     if (opt_verbose)
       printf("// Loaded spec -- sigsize: %d, #initial: %d, #goal: %d, #universal: %d, #step: %d\n",sigsize,initial.size(),goal.size(),universal.size(),step.size());
 
